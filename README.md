@@ -186,10 +186,28 @@ secrets (readable only by its owner), `docker-compose.yml`, `Caddyfile`, and `ba
 |---|---|---|
 | OS | Linux (x86_64 or arm64) | macOS, Linux, or Windows with Docker Desktop |
 | Docker | Docker Engine with Compose v2 | Docker Desktop or Engine with Compose v2 |
-| Memory | 4 GB minimum, 8 GB recommended | 4 GB free |
-| Disk | 20 GB + your mail | 5 GB |
+| Memory | 2 GB minimum, 4 GB recommended (see sizing below) | 2 GB free |
+| Disk | 10 GB + your mail | 5 GB |
 | Network | Public IP; inbound 25, 80, 443, 465, 587, 993; outbound 25 | Port 8080 free |
 | DNS | A domain you can add records to | None |
+
+### Sizing
+
+Measured at idle with demo data: the whole stack (Auth, Mail, Calendar, PostgreSQL, NATS) uses about
+**400 MB of RAM** and **0.7 GB of disk** before any mail is stored. Auth briefly uses ~64 MB more per
+sign-in while it hashes the password (argon2id).
+
+| Team size | CPU | RAM | Disk |
+|---|---|---|---|
+| Trial, up to 10 users | 1 vCPU | 2 GB | 10 GB SSD |
+| Small team, up to 50 users | 2 vCPU | 4 GB | 40 GB SSD + mailbox storage |
+| Around 500 users | 4 vCPU | 8 GB | 100 GB+, S3-compatible storage for mail |
+
+- **Mail is what fills the disk:** plan for users × average mailbox size (50 users × 2 GB ≈ 100 GB).
+  An attachment sent to many people is stored once.
+- **Optional filters:** ClamAV antivirus needs about 1–1.5 GB more RAM, rspamd spam filtering about 300 MB.
+  With both enabled, 4 GB is the practical minimum.
+- The 500-user row is an estimate; load testing is still on the roadmap.
 
 Many cloud providers block outbound port 25 by default. Ask them to open it, or configure a smarthost
 relay for outgoing mail. Set the server's reverse DNS (PTR) to your Suitehive hostname.
