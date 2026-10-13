@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="#status"><img alt="Status: early development" src="https://img.shields.io/badge/status-early%20development-f7de83?style=flat-square&labelColor=222b36"></a>
-  <a href="#license"><img alt="License: to be decided" src="https://img.shields.io/badge/license-TBD-737d8c?style=flat-square&labelColor=222b36"></a>
+  <a href="#license"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-4546b8?style=flat-square&labelColor=222b36"></a>
   <img alt="Protocols: IMAP, SMTP, CalDAV, OIDC" src="https://img.shields.io/badge/protocols-IMAP%20·%20SMTP%20·%20CalDAV%20·%20OIDC-4546b8?style=flat-square&labelColor=222b36">
   <img alt="Self-hosted with Docker Compose" src="https://img.shields.io/badge/install-docker%20compose-2f79a6?style=flat-square&labelColor=222b36">
 </p>
@@ -321,8 +321,7 @@ Please report security problems privately to the maintainers instead of opening 
 
 ## License
 
-The license has not been chosen yet. Until it is, no license is granted to use, copy or distribute this code.
-A license will be added before the first release.
+Suitehive is licensed under the [GNU Affero General Public License v3.0](https://www.gnu.org/licenses/agpl-3.0.html) (AGPL-3.0). You can use, self-host, modify and share it freely. If you run a modified version as a service for others, you must publish your changes under the same license. See [LICENSE](LICENSE).
 
 <p align="center">
   <br>
