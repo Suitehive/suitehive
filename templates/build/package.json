@@ -1,0 +1,10 @@
+{
+  "name": "suitehive-workspace",
+  "private": true,
+  "workspaces": ["contracts/ts", "ui/packages/*", "auth/web", "mail/web", "calendar/web"],
+  "scripts": {
+    "dev:auth": "npm run dev -w auth/web",
+    "dev:mail": "npm run dev -w mail/web",
+    "dev:calendar": "npm run dev -w calendar/web"
+  }
+}

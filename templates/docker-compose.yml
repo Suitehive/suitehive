@@ -1,0 +1,206 @@
+# Suitehive: production docker compose stack.
+#
+# Installed by `suitehive install` as <dir>/docker-compose.yml. This file is a static
+# template: every per-install value (domain, ports, secrets, image tag) comes from
+# <dir>/.env through ${VAR} interpolation. Edit .env, not this file; `suitehive
+# upgrade` refreshes this file from the release (a .bak copy of your old one is kept).
+#
+#   caddy     TLS (ACME) + path routing for the single public hostname
+#   postgres  one database per service (initdb/01-databases.sql)
+#   nats      JetStream event bus
+#   auth      identity, SSO/OIDC, admin, first-run setup     (HTTP :8081)
+#   mail      SMTP/IMAP + webmail API                         (HTTP :8082)
+#   calendar  calendars, CalDAV, scheduling                   (HTTP :8083)
+#
+# Contract with the service images (ghcr.io/suitehive/{auth,mail,calendar}):
+#   * configuration only through the SH_* environment variables below;
+#   * GET /healthz on the HTTP port answers 200 once the service is ready;
+#   * the image ships a `wget` (busybox is fine) for the healthchecks below.
+#
+# Secrets are passed explicitly per service (no env_file), so each container only
+# sees what it needs.
+
+name: suitehive
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-app-healthcheck: &app-healthcheck
+  interval: 10s
+  timeout: 5s
+  retries: 6
+  start_period: 60s
+
+services:
+  caddy:
+    image: caddy:2.10
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - "${SH_HTTP_PORT:-80}:80"
+      - "${SH_HTTPS_PORT:-443}:443"
+      - "${SH_HTTPS_PORT:-443}:443/udp" # HTTP/3
+    environment:
+      SH_SITE_ADDRESS: ${SH_SITE_ADDRESS:?SH_SITE_ADDRESS is not set (see .env)}
+      SH_TLS_EMAIL: ${SH_TLS_EMAIL:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      auth:
+        condition: service_started
+      mail:
+        condition: service_started
+      calendar:
+        condition: service_started
+
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_USER: suitehive
+      POSTGRES_PASSWORD: ${SH_POSTGRES_PASSWORD:?SH_POSTGRES_PASSWORD is not set (see .env)}
+      POSTGRES_DB: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U suitehive -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  nats:
+    # The -alpine variant ships wget, which the healthcheck needs (the plain image
+    # is scratch-based). Monitoring (-m 8222) stays on the internal network.
+    image: nats:2.11-alpine
+    restart: unless-stopped
+    logging: *logging
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      - natsdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  auth:
+    image: ghcr.io/suitehive/auth:${SH_VERSION:-edge}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      SH_DB_URL: postgres://suitehive:${SH_POSTGRES_PASSWORD}@postgres:5432/suitehive_auth?sslmode=disable
+      SH_NATS_URL: nats://nats:4222
+      SH_MASTER_KEY: ${SH_MASTER_KEY:?SH_MASTER_KEY is not set (see .env)}
+      SH_PUBLIC_URL: ${SH_PUBLIC_URL:?SH_PUBLIC_URL is not set (see .env)}
+      SH_HTTP_ADDR: ":8081"
+      # Auth sends its own mail (invites, password resets) over plain SMTP submission, so it never
+      # depends on the Mail service's API (01-hld §8.5). Points at Suitehive Mail by default; any relay works.
+      SH_EMAIL_SMTP_URL: ${SH_EMAIL_SMTP_URL:-smtp://mail:587}
+      SH_EMAIL_FROM: ${SH_EMAIL_FROM:-Suitehive <no-reply@${SH_DOMAIN}>}
+      # Client-credentials secrets of the service clients Auth registers for Mail
+      # and Calendar (the same values are given to those services below).
+      SH_MAIL_CLIENT_SECRET: ${SH_MAIL_CLIENT_SECRET:?SH_MAIL_CLIENT_SECRET is not set (see .env)}
+      SH_CALENDAR_CLIENT_SECRET: ${SH_CALENDAR_CLIENT_SECRET:?SH_CALENDAR_CLIENT_SECRET is not set (see .env)}
+      SH_DEV_SEED: ${SH_DEV_SEED:-false}
+      SH_DEV_INSECURE_COOKIES: ${SH_DEV_INSECURE_COOKIES:-false}
+      SH_LOG_LEVEL: ${SH_LOG_LEVEL:-info}
+    ports:
+      # Loopback only: lets the `suitehive` CLI check health and run first-time
+      # setup without going through the public hostname. Never exposed publicly.
+      - "127.0.0.1:${SH_AUTH_LOCAL_PORT:-8081}:8081"
+    healthcheck:
+      <<: *app-healthcheck
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8081/healthz >/dev/null || exit 1"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  mail:
+    image: ghcr.io/suitehive/mail:${SH_VERSION:-edge}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      SH_DB_URL: postgres://suitehive:${SH_POSTGRES_PASSWORD}@postgres:5432/suitehive_mail?sslmode=disable
+      SH_NATS_URL: nats://nats:4222
+      SH_MASTER_KEY: ${SH_MASTER_KEY}
+      SH_PUBLIC_URL: ${SH_PUBLIC_URL}
+      SH_HTTP_ADDR: ":8082"
+      SH_SMTP_ADDR: ":25"
+      SH_SMTPS_ADDR: ":465"
+      SH_SUBMISSION_ADDR: ":587"
+      SH_IMAPS_ADDR: ":993"
+      SH_MAIL_HOSTNAME: ${SH_HOSTNAME:?SH_HOSTNAME is not set (see .env)}
+      SH_MAIL_DOMAIN: ${SH_DOMAIN:?SH_DOMAIN is not set (see .env)}
+      SH_AUTHN_ISSUER: ${SH_PUBLIC_URL}
+      SH_AUTHN_JWKS_URL: http://auth:8081/jwks
+      SH_AUTHN_AUDIENCE: mail
+      SH_AUTH_RPC_URL: http://auth:8081
+      SH_TOKEN_URL: http://auth:8081/oauth2/token
+      SH_CLIENT_ID: "svc:mail"
+      SH_CLIENT_SECRET: ${SH_MAIL_CLIENT_SECRET}
+      SH_BLOB_DIR: /data/blobs
+      # SMTP/IMAP TLS reuses the certificate Caddy obtains for SH_HOSTNAME. Mail
+      # looks for <SH_TLS_CERT_DIR>/<issuer>/<hostname>/<hostname>.{crt,key}
+      # (Caddy's storage layout), reloads it on renewal, and falls back to a
+      # self-signed certificate until it exists (e.g. in --local mode).
+      SH_TLS_CERT_DIR: /certs/caddy/certificates
+      SH_DEV_SEED: ${SH_DEV_SEED:-false}
+      SH_LOG_LEVEL: ${SH_LOG_LEVEL:-info}
+    ports:
+      # Mail protocols are L4: published directly, not through Caddy.
+      - "${SH_SMTP_PORT:-25}:25"
+      - "${SH_SMTPS_PORT:-465}:465"
+      - "${SH_SUBMISSION_PORT:-587}:587"
+      - "${SH_IMAPS_PORT:-993}:993"
+    volumes:
+      - mailblobs:/data/blobs
+      - caddy_data:/certs:ro
+    healthcheck:
+      <<: *app-healthcheck
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8082/healthz >/dev/null || exit 1"]
+    depends_on:
+      auth:
+        condition: service_healthy
+
+  calendar:
+    image: ghcr.io/suitehive/calendar:${SH_VERSION:-edge}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      SH_DB_URL: postgres://suitehive:${SH_POSTGRES_PASSWORD}@postgres:5432/suitehive_calendar?sslmode=disable
+      SH_NATS_URL: nats://nats:4222
+      SH_MASTER_KEY: ${SH_MASTER_KEY}
+      SH_PUBLIC_URL: ${SH_PUBLIC_URL}
+      SH_HTTP_ADDR: ":8083"
+      SH_AUTHN_ISSUER: ${SH_PUBLIC_URL}
+      SH_AUTHN_JWKS_URL: http://auth:8081/jwks
+      SH_AUTHN_AUDIENCE: calendar
+      SH_AUTH_RPC_URL: http://auth:8081
+      SH_MAIL_RPC_URL: http://mail:8082
+      SH_TOKEN_URL: http://auth:8081/oauth2/token
+      SH_CLIENT_ID: "svc:calendar"
+      SH_CLIENT_SECRET: ${SH_CALENDAR_CLIENT_SECRET}
+      SH_DEV_SEED: ${SH_DEV_SEED:-false}
+      SH_LOG_LEVEL: ${SH_LOG_LEVEL:-info}
+    healthcheck:
+      <<: *app-healthcheck
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8083/healthz >/dev/null || exit 1"]
+    depends_on:
+      auth:
+        condition: service_healthy
+
+volumes:
+  pgdata: {}
+  natsdata: {}
+  mailblobs: {}
+  caddy_data: {}
+  caddy_config: {}

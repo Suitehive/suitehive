@@ -217,22 +217,22 @@ same checklist under **Admin → Domains**, including the DKIM record once it's 
 ## CLI reference
 
 The installer puts the `suitehive` command in `/usr/local/bin` (or `~/.local/bin` without root). Every
-command takes `--help`.
+command takes `--help`, and `--dir`, `--yes` work everywhere.
 
 | Command | What it does |
 |---|---|
-| `suitehive install` | Checks the machine, generates secrets, writes `.env`, `docker-compose.yml` and `Caddyfile`, starts the stack, creates your organization and admin, and prints URLs and DNS records. Flags: `--domain`, `--hostname`, `--admin-email`, `--admin-name`, `--admin-password`, `--org-name`, `--dir`, `--tls-email`, `--version`, `--local`, `--build`, `--yes`, `--dry-run`. |
+| `suitehive install` | Checks the machine, generates secrets, writes `.env`, `docker-compose.yml` and `Caddyfile`, starts the stack, creates your organization and admin, and prints URLs and DNS records. Flags: `--domain`, `--hostname`, `--admin-email`, `--admin-name`, `--admin-password`, `--org-name`, `--dir`, `--tls-email`, `--version`, `--local`, `--build`, `--yes`, `--dry-run`, `--force` (new secrets, fresh start only), `--skip-checks` (allow less than 4 GB RAM). |
 | `suitehive status` | Shows each service, its health, the installed version and your URLs. |
-| `suitehive logs [service] [-f]` | Shows recent logs for all services or one (`caddy`, `postgres`, `nats`, `auth`, `mail`, `calendar`). |
-| `suitehive upgrade [--version X]` | Offers a backup, pulls new images and restarts. Your `.env` and data are kept. |
+| `suitehive logs [service] [-f] [--tail n]` | Shows the last 200 log lines for all services or one (`caddy`, `postgres`, `nats`, `auth`, `mail`, `calendar`). |
+| `suitehive upgrade [--version X] [--backup]` | Offers a backup, refreshes the templates, pulls new images and restarts. Your `.env` and data are kept. |
 | `suitehive backup [--out file]` | Writes a `.tar.gz` with a database dump, your mail storage and your config. The archive contains secrets, so keep it safe. |
-| `suitehive restore <file>` | Restores a backup into this install (asks you to confirm first). |
-| `suitehive dns [--check]` | Prints the DNS records to create and checks which ones already exist. |
-| `suitehive uninstall [--purge]` | Stops Suitehive. Your data is kept unless you add `--purge`. |
+| `suitehive restore <file> [--keep-env]` | Replaces all current data with a backup (asks you to type the domain first). Also works on a fresh server. |
+| `suitehive dns [--check \| --no-check] [--token T]` | Prints the DNS records to create and checks which ones already exist. With an admin API token it also prints the DKIM record. |
+| `suitehive uninstall [--purge]` | Stops and removes the containers. Your data is kept unless you add `--purge` (asks you to type the domain). |
 | `suitehive version` | Prints the CLI version, the installed Suitehive version and the Docker Compose version. |
 
-Every `install` flag also works as an environment variable (`SH_DOMAIN`, `SH_HOSTNAME`, `SH_DIR` …), which is
-handy for automation.
+Most `install` flags also work as environment variables (`SH_DOMAIN`, `SH_HOSTNAME`, `SH_ADMIN_EMAIL`,
+`SH_ADMIN_PASSWORD`, `SH_VERSION`, `SH_DIR` …), which is handy for automation.
 
 ## Roadmap
 

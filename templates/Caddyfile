@@ -1,0 +1,71 @@
+# Suitehive: Caddy gateway (TLS + path routing).
+#
+# Installed by `suitehive install` as <dir>/Caddyfile. It is static: per-install
+# values come from environment variables that docker compose passes from .env:
+#
+#   SH_SITE_ADDRESS  public hostname, e.g. suite.example.com, which turns on
+#                    automatic HTTPS (Let's Encrypt / ZeroSSL). Set it to ":80"
+#                    for plain HTTP (local trial or behind another TLS proxy).
+#   SH_TLS_EMAIL     ACME account email (certificate expiry notices).
+#
+# Routing follows docs/design/01-hld.md §5: one public hostname, routed by path.
+# Order matters: the first matching `handle` block wins, so the specific
+# /.well-known/caldav and /.well-known/carddav routes come before auth's
+# /.well-known/* catch-all.
+#
+# No global Content-Security-Policy here: each app (auth, mail, calendar) sets
+# its own CSP, and mail's HTML-message sandbox needs a different policy from
+# the rest.
+
+{
+	email {$SH_TLS_EMAIL:admin@localhost}
+}
+
+(security_headers) {
+	header {
+		# Ignored by browsers over plain HTTP, so it is harmless in local mode.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		# Defaults only: an app that sets its own value wins ("?" = set if absent).
+		?Referrer-Policy "strict-origin-when-cross-origin"
+		# SAMEORIGIN, not DENY: mail renders message bodies in same-origin iframes.
+		?X-Frame-Options "SAMEORIGIN"
+		?Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+}
+
+{$SH_SITE_ADDRESS::80} {
+	encode zstd gzip
+	import security_headers
+
+	# Calendar: web app, API, CalDAV, and the CalDAV/CardDAV discovery URLs.
+	@calendar path /calendar /calendar/* /api/calendar/* /dav /dav/* /.well-known/caldav /.well-known/carddav
+	handle @calendar {
+		reverse_proxy calendar:8083
+	}
+
+	# Mail: web app and API (SMTP/IMAP are L4 ports published by the mail container).
+	@mail path /mail /mail/* /api/mail/*
+	handle @mail {
+		reverse_proxy mail:8082
+	}
+
+	# Auth: sign-in, account, admin console, first-run setup, invitations,
+	# OAuth2/OIDC (discovery, JWKS, token endpoints) and its APIs.
+	@auth path /login /login/* /logout /logout/* /account /account/* /admin /admin/* /setup /setup/* /invite /invite/* /consent /consent/* /oauth2/* /.well-known/* /jwks /jwks/* /jwks.json /api/auth/* /api/admin/*
+	handle @auth {
+		reverse_proxy auth:8081
+	}
+
+	# The suite opens on Mail.
+	@root path /
+	handle @root {
+		redir * /mail 302
+	}
+
+	# Anything else (favicon, robots.txt, shared assets, 404 page) is Auth's.
+	handle {
+		reverse_proxy auth:8081
+	}
+}

@@ -1,0 +1,32 @@
+# Suitehive: build-from-source override (used by `suitehive install --build`).
+#
+# Layered on top of docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml build
+#
+# The build context is ./src, a workspace that `suitehive install --build` creates
+# by cloning github.com/Suitehive/{kit,contracts,ui,auth,mail,calendar} next to a
+# go.work and an npm-workspaces package.json. Each service repo ships its own
+# Dockerfile at <service>/Dockerfile, written against that workspace root.
+#
+# Images keep the same names as the published ones, so nothing else changes.
+services:
+  auth:
+    image: ghcr.io/suitehive/auth:${SH_VERSION:-local}
+    pull_policy: build
+    build:
+      context: ./src
+      dockerfile: auth/Dockerfile
+
+  mail:
+    image: ghcr.io/suitehive/mail:${SH_VERSION:-local}
+    pull_policy: build
+    build:
+      context: ./src
+      dockerfile: mail/Dockerfile
+
+  calendar:
+    image: ghcr.io/suitehive/calendar:${SH_VERSION:-local}
+    pull_policy: build
+    build:
+      context: ./src
+      dockerfile: calendar/Dockerfile

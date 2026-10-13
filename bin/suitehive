@@ -1,0 +1,2014 @@
+#!/usr/bin/env bash
+#
+# suitehive: install and operate a self-hosted Suitehive
+# (Mail, Calendar, and shared sign-in/admin) with docker compose.
+#
+#   suitehive install [--domain example.com]   set up a new server (or --local trial)
+#   suitehive status | logs | dns              look at a running install
+#   suitehive upgrade | backup | restore       day-2 operations
+#   suitehive uninstall | version | help
+#
+# Run `suitehive help <command>` for details on each command.
+#
+# How this script is organized (read it before you run it, it's meant for that):
+#   1. constants
+#   2. output helpers (colors only on a TTY and when NO_COLOR is unset)
+#   3. generic helpers: prompts, .env access, downloads, secrets, JSON, compose
+#   4. checks (docker, memory, ports)
+#   5. one cmd_<name> + help_<name> per command
+#   6. main: global options and dispatch
+#
+# Everything an install needs lives in one directory (default /opt/suitehive as
+# root, ~/suitehive otherwise): .env (settings + secrets, mode 600),
+# docker-compose.yml, Caddyfile, initdb/, backups/ and, for --build, src/.
+# The CLI finds it via --dir, $SH_DIR, ./.env in the current directory, or the
+# default location, in that order.
+#
+# Runs on bash 3.2+ (macOS default) and needs docker with compose v2, curl (or
+# wget), openssl (or base64), tar and gzip.
+
+set -euo pipefail
+
+# ============================================================== 1. constants ==
+
+SUITEHIVE_CLI_VERSION="0.1.0-dev"
+
+# Default image tag for ghcr.io/suitehive/*: "edge" tracks main. Pin a release
+# with `install --version 0.1.0` / `upgrade --version 0.1.0`.
+DEFAULT_IMAGE_TAG="edge"
+# Tag given to locally built images (--build) unless --version is passed.
+BUILD_IMAGE_TAG="local"
+
+# Where templates are downloaded from when not running from a clone.
+REPO_RAW="${SH_REPO_RAW:-https://raw.githubusercontent.com/Suitehive/suitehive/${SH_REF:-main}}"
+# Where --build clones the service repositories from.
+GIT_BASE="${SH_GIT_BASE:-https://github.com/Suitehive}"
+
+ALL_SERVICES="caddy postgres nats auth mail calendar"
+APP_SERVICES="auth mail calendar"
+INFRA_SERVICES="caddy postgres nats"
+BUILD_REPOS="kit contracts ui auth mail calendar"
+DATABASES="suitehive_auth suitehive_mail suitehive_calendar"
+
+# Demo data seeded in --local mode (SH_DEV_SEED=true).
+DEMO_DOMAIN="suitehive.local"
+DEMO_PASSWORD="suitehive-dev"
+DEMO_USERS="admin priya alex"
+
+# Seconds to wait for auth's /healthz after `docker compose up`.
+HEALTH_TIMEOUT="${SH_HEALTH_TIMEOUT:-180}"
+# 4 GB is the documented minimum. A "4 GB" VPS reports a bit less than 4 GiB of
+# MemTotal (kernel reservations), so the hard limit is 3.5 GiB.
+MIN_MEM_KB=3670016
+
+# Every key the CLI manages in .env. Lines with other keys are preserved as-is
+# when install rewrites the file.
+KNOWN_ENV_KEYS="SH_VERSION SH_DOMAIN SH_HOSTNAME SH_PUBLIC_URL SH_SITE_ADDRESS SH_TLS_EMAIL
+SH_ORG_NAME SH_ORG_SLUG SH_ADMIN_EMAIL SH_ADMIN_NAME SH_VERIFY_TXT_NAME SH_VERIFY_TXT_VALUE
+SH_LOCAL SH_BUILD SH_HTTP_PORT SH_HTTPS_PORT SH_SMTP_PORT SH_SMTPS_PORT SH_SUBMISSION_PORT
+SH_IMAPS_PORT SH_AUTH_LOCAL_PORT SH_DEV_SEED SH_DEV_INSECURE_COOKIES SH_LOG_LEVEL
+SH_MASTER_KEY SH_POSTGRES_PASSWORD SH_MAIL_CLIENT_SECRET SH_CALENDAR_CLIENT_SECRET"
+
+# Set by option parsing.
+DIR=""            # resolved install directory (absolute)
+OPT_DIR=""        # --dir
+ASSUME_YES=0      # --yes
+DRY_RUN=0         # --dry-run
+TTY_READY=""      # cached result of tty_ready
+CLEANUP_PATHS=""  # temp paths removed on exit (newline-separated)
+
+# ======================================================== 2. output helpers ==
+
+setup_output() {
+  if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
+    C_BOLD=$'\033[1m' C_DIM=$'\033[2m' C_RED=$'\033[31m' C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m' C_BLUE=$'\033[34m' C_CYAN=$'\033[36m' C_RESET=$'\033[0m'
+  else
+    C_BOLD="" C_DIM="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_CYAN="" C_RESET=""
+  fi
+  # Unicode marks only when the locale can display them.
+  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*) G_OK="✓" G_BAD="✗" G_NE="≠" G_WAIT="…" ;;
+    *) G_OK="+" G_BAD="x" G_NE="!=" G_WAIT="..." ;;
+  esac
+}
+
+header() { printf '%s%s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
+step() { printf '%s==>%s %s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$*" "$C_RESET"; }
+info() { printf '    %s\n' "$*"; }
+ok() { printf '    %s%s%s %s\n' "$C_GREEN" "$G_OK" "$C_RESET" "$*"; }
+note() { printf '    %s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
+warn() { printf '%swarning:%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die() {
+  printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2
+  exit 1
+}
+# kv <label> <value>: one aligned summary line.
+kv() { printf '  %-13s %s\n' "$1" "$2"; }
+dry() { printf '    %s[dry-run]%s %s\n' "$C_DIM" "$C_RESET" "$*"; }
+
+# quote_args <args...>: render a command line that can be pasted into a shell.
+quote_args() {
+  local out="" a re='^[A-Za-z0-9_./:=@%+,-]+$'
+  for a in "$@"; do
+    if [[ $a =~ $re ]]; then
+      out="$out$a "
+    else
+      out="$out'${a//\'/\'\\\'\'}' "
+    fi
+  done
+  printf '%s' "${out% }"
+}
+
+# ======================================================= 3. generic helpers ==
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+cleanup() {
+  local p
+  if [[ -n $CLEANUP_PATHS ]]; then
+    while IFS= read -r p; do
+      [[ -n $p ]] && rm -rf "$p" 2>/dev/null || true
+    done <<<"$CLEANUP_PATHS"
+  fi
+}
+trap cleanup EXIT
+on_exit_remove() { CLEANUP_PATHS="$CLEANUP_PATHS"$'\n'"$1"; }
+
+# need_value <option> <remaining args...>: options that take a value.
+need_value() {
+  [[ $# -ge 2 && -n ${2:-} ]] || die "$1 needs a value (see --help)"
+}
+
+# pick <values...>: print the first non-empty argument.
+pick() {
+  local v
+  for v in "$@"; do
+    if [[ -n $v ]]; then
+      printf '%s' "$v"
+      return 0
+    fi
+  done
+}
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# script_dir: directory of this script, following symlinks (no readlink -f on
+# older macOS).
+script_dir() {
+  local src=${BASH_SOURCE[0]} dir
+  while [[ -L $src ]]; do
+    dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    if [[ $src != /* ]]; then src=$dir/$src; fi
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+# abs_path <path>: absolute path, without requiring it to exist.
+abs_path() {
+  local p=$1
+  case $p in
+    "~") p=$HOME ;;
+    "~/"*) p=$HOME/${p#"~/"} ;;
+  esac
+  if [[ -d $p ]]; then
+    (cd "$p" && pwd)
+  elif [[ $p == /* || $p =~ ^[A-Za-z]:[/\\] ]]; then # (drive letters: Git Bash/WSL interop)
+    printf '%s' "${p%/}"
+  else
+    printf '%s/%s' "$PWD" "${p%/}"
+  fi
+}
+
+# ------------------------------------------------------------------ prompts --
+
+# tty_ready: true when we may ask questions. Works under `curl ... | sh` too:
+# stdin is the pipe then, so questions are read from /dev/tty (fd 3).
+tty_ready() {
+  if [[ -z $TTY_READY ]]; then
+    TTY_READY=no
+    if [[ $ASSUME_YES != 1 ]]; then
+      if [[ -t 0 ]]; then
+        exec 3<&0
+        TTY_READY=yes
+      elif { exec 3</dev/tty; } 2>/dev/null; then
+        TTY_READY=yes
+      fi
+    fi
+  fi
+  [[ $TTY_READY == yes ]]
+}
+
+# ask <var> <question> [default]: sets <var> to the answer, or the default when
+# the answer is empty or we cannot ask.
+ask() {
+  local __var=$1 __q=$2 __def=${3:-} __ans=""
+  if tty_ready; then
+    if [[ -n $__def ]]; then
+      printf '%s?%s %s %s[%s]%s: ' "$C_CYAN" "$C_RESET" "$__q" "$C_DIM" "$__def" "$C_RESET" >&2
+    else
+      printf '%s?%s %s: ' "$C_CYAN" "$C_RESET" "$__q" >&2
+    fi
+    IFS= read -r __ans <&3 || __ans=""
+  fi
+  printf -v "$__var" '%s' "${__ans:-$__def}"
+}
+
+# ask_secret <var> <question>: like ask, without echo and without a default.
+ask_secret() {
+  local __var=$1 __q=$2 __ans=""
+  if tty_ready; then
+    printf '%s?%s %s: ' "$C_CYAN" "$C_RESET" "$__q" >&2
+    IFS= read -rs __ans <&3 || __ans=""
+    printf '\n' >&2
+  fi
+  printf -v "$__var" '%s' "$__ans"
+}
+
+# confirm <question> <y|n>: yes/no question. --yes answers yes; without a
+# terminal the default is used.
+confirm() {
+  local q=$1 def=${2:-n} ans hint
+  if [[ $ASSUME_YES == 1 ]]; then return 0; fi
+  if ! tty_ready; then
+    if [[ $def == y ]]; then return 0; else return 1; fi
+  fi
+  if [[ $def == y ]]; then hint="Y/n"; else hint="y/N"; fi
+  printf '%s?%s %s [%s] ' "$C_CYAN" "$C_RESET" "$q" "$hint" >&2
+  IFS= read -r ans <&3 || ans=""
+  ans=$(lower "${ans:-$def}")
+  [[ $ans == y || $ans == yes ]]
+}
+
+# confirm_typed <expected> <message>: destructive actions. The user must type
+# <expected> (the domain) unless --yes was given.
+confirm_typed() {
+  local expected=$1 msg=$2 ans=""
+  if [[ $ASSUME_YES == 1 ]]; then return 0; fi
+  tty_ready || die "$msg. Re-run with --yes to confirm without a terminal."
+  printf '%s%s%s\n' "$C_YELLOW" "$msg" "$C_RESET" >&2
+  printf '%s?%s Type %s%s%s to confirm: ' "$C_CYAN" "$C_RESET" "$C_BOLD" "$expected" "$C_RESET" >&2
+  IFS= read -r ans <&3 || ans=""
+  [[ $ans == "$expected" ]] || die "confirmation did not match; nothing was changed"
+}
+
+# -------------------------------------------------------- install directory --
+
+default_dir() {
+  if [[ $(id -u) == 0 ]]; then printf '/opt/suitehive'; else printf '%s/suitehive' "$HOME"; fi
+}
+
+# resolve_dir: --dir, $SH_DIR, an install in the current directory, default.
+resolve_dir() {
+  if [[ -n $OPT_DIR ]]; then
+    DIR=$OPT_DIR
+  elif [[ -n ${SH_DIR:-} ]]; then
+    DIR=$SH_DIR
+  elif [[ -f ./.env && -f ./docker-compose.yml ]] && grep -q '^SH_DOMAIN=' ./.env 2>/dev/null; then
+    DIR=$PWD
+  else
+    DIR=$(default_dir)
+  fi
+  DIR=$(abs_path "$DIR")
+}
+
+# require_install: the commands other than install need an existing install.
+require_install() {
+  resolve_dir
+  [[ -f $DIR/.env ]] || die "no Suitehive install found in $DIR
+       Use --dir <path> or set SH_DIR (or run \`suitehive install\` first)."
+  [[ -f $DIR/docker-compose.yml ]] || die "$DIR/docker-compose.yml is missing; run \`suitehive upgrade\` to restore it"
+  load_settings
+}
+
+# ---------------------------------------------------------------- .env I/O --
+
+# env_get <KEY> [file]: value of KEY in a dotenv file (quotes removed).
+env_get() {
+  local key=$1 file=${2:-$DIR/.env} line
+  [[ -f $file ]] || return 1
+  line=$(grep -E "^${key}=" "$file" | tail -n 1) || return 1
+  line=${line#*=}
+  line=${line%$'\r'}
+  if [[ ${#line} -ge 2 && $line == \"*\" ]]; then
+    line=${line:1:${#line}-2}
+  elif [[ ${#line} -ge 2 && $line == \'*\' ]]; then
+    line=${line:1:${#line}-2}
+  fi
+  printf '%s' "$line"
+}
+
+# prev <KEY>: value from the existing .env, or nothing.
+prev() { env_get "$1" 2>/dev/null || true; }
+
+# env_set <KEY> <value>: replace or append KEY in .env, keeping mode 600.
+env_set() {
+  local key=$1 val file=$DIR/.env tmp
+  val=$(env_quote "$2")
+  tmp=$(mktemp "$DIR/.env.XXXXXX")
+  K="$key" V="$val" awk '
+    BEGIN { k = ENVIRON["K"]; v = ENVIRON["V"]; done = 0 }
+    index($0, k "=") == 1 { if (!done) print k "=" v; done = 1; next }
+    { print }
+    END { if (!done) print k "=" v }
+  ' "$file" >"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$file"
+}
+
+# env_quote <value>: dotenv-safe value. Simple values stay bare; anything else
+# is double-quoted with characters that docker compose would interpret ($, ",
+# \, `) removed. Only free-text fields (names) ever need this.
+env_quote() {
+  local v=$1 re='^[A-Za-z0-9._@:/+=,-]*$'
+  if [[ $v =~ $re ]]; then
+    printf '%s' "$v"
+  else
+    v=$(printf '%s' "$v" | tr -d '"$\\`' | tr -d '\000-\037')
+    printf '"%s"' "$v"
+  fi
+}
+
+# load_settings: read the install's settings into globals.
+load_settings() {
+  DOMAIN=$(prev SH_DOMAIN)
+  SITE_HOST=$(prev SH_HOSTNAME)
+  PUBLIC_URL=$(prev SH_PUBLIC_URL)
+  IMAGE_TAG=$(pick "$(prev SH_VERSION)" "$DEFAULT_IMAGE_TAG")
+  LOCAL=$(pick "$(prev SH_LOCAL)" false)
+  BUILD=$(pick "$(prev SH_BUILD)" false)
+  AUTH_PORT=$(pick "$(prev SH_AUTH_LOCAL_PORT)" 8081)
+  ADMIN_EMAIL=$(prev SH_ADMIN_EMAIL)
+  VERIFY_NAME=$(prev SH_VERIFY_TXT_NAME)
+  VERIFY_VALUE=$(prev SH_VERIFY_TXT_VALUE)
+}
+
+# ------------------------------------------------------------- downloads --
+
+# download <url> <dest>: fetch to a temp file, then move into place.
+download() {
+  local url=$1 dest=$2 tmp="$2.part.$$"
+  if have curl; then
+    curl -fsSL --retry 2 --connect-timeout 10 -o "$tmp" "$url" || {
+      rm -f "$tmp"
+      die "download failed: $url"
+    }
+  elif have wget; then
+    wget -q -T 20 -O "$tmp" "$url" || {
+      rm -f "$tmp"
+      die "download failed: $url"
+    }
+  else
+    die "curl or wget is required to download $url"
+  fi
+  mv -f "$tmp" "$dest"
+}
+
+# Templates ship next to this script in a clone (../templates); otherwise they
+# are downloaded from $REPO_RAW. SH_TEMPLATES_DIR overrides both.
+templates_dir() {
+  if [[ -n ${SH_TEMPLATES_DIR:-} ]]; then
+    printf '%s' "$SH_TEMPLATES_DIR"
+  else
+    printf '%s/../templates' "$(script_dir)"
+  fi
+}
+
+templates_source() {
+  local t
+  t=$(templates_dir)
+  if [[ -f $t/docker-compose.yml ]]; then (cd "$t" && pwd); else printf '%s/templates' "$REPO_RAW"; fi
+}
+
+# fetch_template <relpath> <dest>: install one template file. A changed existing
+# file is kept as <dest>.bak.
+fetch_template() {
+  local rel=$1 dest=$2 src new
+  src="$(templates_dir)/$rel"
+  new="$dest.new.$$"
+  mkdir -p "$(dirname "$dest")"
+  if [[ -f $src ]]; then
+    cp "$src" "$new"
+  else
+    download "$REPO_RAW/templates/$rel" "$new"
+  fi
+  [[ -s $new ]] || {
+    rm -f "$new"
+    die "template $rel is empty"
+  }
+  if [[ -f $dest ]] && [[ "$(cat "$dest")" != "$(cat "$new")" ]]; then
+    cp -p "$dest" "$dest.bak"
+    note "updated $(basename "$dest") (previous version kept as $(basename "$dest").bak)"
+  fi
+  mv -f "$new" "$dest"
+}
+
+# install_templates: the compose stack files (not .env).
+install_templates() {
+  fetch_template docker-compose.yml "$DIR/docker-compose.yml"
+  fetch_template Caddyfile "$DIR/Caddyfile"
+  fetch_template initdb/01-databases.sql "$DIR/initdb/01-databases.sql"
+  if [[ $BUILD == true ]]; then
+    fetch_template docker-compose.build.yml "$DIR/docker-compose.build.yml"
+  fi
+}
+
+# --------------------------------------------------------------- secrets --
+
+# rand_b64 <nbytes>: random bytes, base64 (standard alphabet, one line).
+rand_b64() {
+  if have openssl; then
+    openssl rand -base64 "$1" | tr -d '\n'
+  elif [[ -r /dev/urandom ]] && have base64; then
+    head -c "$1" /dev/urandom | base64 | tr -d '\n'
+  else
+    die "need openssl or base64 + /dev/urandom to generate secrets"
+  fi
+}
+
+# rand_alnum <len>: letters and digits only (safe inside URLs and .env).
+rand_alnum() {
+  local out=""
+  while [[ ${#out} -lt $1 ]]; do
+    out="$out$(rand_b64 $(($1 * 2)) | tr -dc 'A-Za-z0-9')"
+  done
+  printf '%s' "${out:0:$1}"
+}
+
+# rand_password: 24 URL-safe characters (~143 bits).
+rand_password() {
+  local out=""
+  while [[ ${#out} -lt 24 ]]; do
+    out="$out$(rand_b64 24 | tr '+/' '-_' | tr -d '=')"
+  done
+  printf '%s' "${out:0:24}"
+}
+
+# ------------------------------------------------------------------ JSON --
+
+# json_escape <string>: JSON string body (no surrounding quotes).
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'
+}
+
+# json_str <file> <jq-path> <key>: a string field. Uses jq when available; the
+# sed fallback returns the first "key":"value" in the document.
+json_str() {
+  local file=$1 path=$2 key=$3
+  if have jq; then
+    jq -r "($path) // empty" "$file" 2>/dev/null || true
+  else
+    tr -d '\n' <"$file" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+  fi
+}
+
+# json_true <file> <key>: true when "key": true appears.
+json_true() { grep -Eq "\"$1\"[[:space:]]*:[[:space:]]*true" "$2"; }
+
+# --------------------------------------------------------- docker compose --
+
+# compose <args...>: docker compose for this install. .env is the single source
+# of truth, so SH_* variables from the caller's shell are removed first (compose
+# would otherwise let them override .env).
+compose() {
+  local files
+  files=(-f "$DIR/docker-compose.yml")
+  if [[ $(prev SH_BUILD) == true && -f $DIR/docker-compose.build.yml ]]; then
+    files=("${files[@]}" -f "$DIR/docker-compose.build.yml")
+  fi
+  (
+    for v in $(compgen -v SH_ || true); do unset "$v" 2>/dev/null || true; done
+    docker compose --project-directory "$DIR" "${files[@]}" "$@"
+  )
+}
+
+# compose_run <args...>: compose, or just print it with --dry-run.
+compose_run() {
+  if [[ $DRY_RUN == 1 ]]; then
+    local f="-f $DIR/docker-compose.yml"
+    if [[ $(prev SH_BUILD) == true ]]; then f="$f -f $DIR/docker-compose.build.yml"; fi
+    dry "docker compose --project-directory $(quote_args "$DIR") $f $(quote_args "$@")"
+  else
+    compose "$@"
+  fi
+}
+
+# run <cmd...>: run a non-compose command, or print it with --dry-run.
+run() {
+  if [[ $DRY_RUN == 1 ]]; then dry "$(quote_args "$@")"; else "$@"; fi
+}
+
+project_name() { pick "${COMPOSE_PROJECT_NAME:-}" "$(prev COMPOSE_PROJECT_NAME)" suitehive; }
+
+# volume_name <volume>: the docker volume compose created for this project.
+volume_name() {
+  local p v
+  p=$(project_name)
+  v=$(docker volume ls -q --filter "label=com.docker.compose.project=$p" \
+    --filter "label=com.docker.compose.volume=$1" 2>/dev/null | head -n 1)
+  pick "$v" "${p}_$1"
+}
+
+stack_running() { [[ -n $(compose ps -q 2>/dev/null || true) ]]; }
+
+# ------------------------------------------------------------------ HTTP --
+
+http_ok() {
+  if have curl; then
+    curl -fsS -o /dev/null --max-time 3 "$1" 2>/dev/null
+  else
+    wget -q -O /dev/null -T 3 "$1" 2>/dev/null
+  fi
+}
+
+# wait_for_auth: poll auth's loopback /healthz with a spinner (dots without a TTY).
+wait_for_auth() {
+  local url="http://127.0.0.1:$AUTH_PORT/healthz" frames='|/-\' i=0
+  local deadline=$((SECONDS + HEALTH_TIMEOUT))
+  if [[ $DRY_RUN == 1 ]]; then
+    dry "wait up to ${HEALTH_TIMEOUT}s for $url"
+    return 0
+  fi
+  printf '    waiting for auth (up to %ss) ' "$HEALTH_TIMEOUT"
+  while [[ $SECONDS -lt $deadline ]]; do
+    if http_ok "$url"; then
+      if [[ -t 1 ]]; then printf '\b'; fi
+      printf '%s%s%s ready\n' "$C_GREEN" "$G_OK" "$C_RESET"
+      return 0
+    fi
+    if [[ -t 1 ]]; then
+      printf '\b%s' "${frames:$i:1}"
+      i=$(((i + 1) % 4))
+      sleep 1
+    else
+      printf '.'
+      sleep 3
+    fi
+  done
+  if [[ -t 1 ]]; then printf '\b'; fi
+  printf '%stimed out%s\n' "$C_RED" "$C_RESET"
+  warn "auth did not become healthy within ${HEALTH_TIMEOUT}s."
+  warn "Look at \`suitehive logs auth\` (and \`suitehive status\`), then re-run the command."
+  return 1
+}
+
+# public_ips: best-effort public IPv4/IPv6 of this server for the DNS table.
+# Override with SH_PUBLIC_IP / SH_PUBLIC_IP6 ("none" skips that address family).
+public_ips() {
+  IP4=${SH_PUBLIC_IP:-}
+  IP6=${SH_PUBLIC_IP6:-}
+  if have curl; then
+    if [[ -z $IP4 ]]; then IP4=$(curl -4 -fsS --max-time 4 https://api.ipify.org 2>/dev/null || true); fi
+    if [[ -z $IP6 ]]; then IP6=$(curl -6 -fsS --max-time 4 https://api6.ipify.org 2>/dev/null || true); fi
+  fi
+  [[ $IP4 == none ]] && IP4=""
+  [[ $IP6 == none ]] && IP6=""
+  [[ $IP4 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || IP4=""
+  [[ $IP6 == *:* && $IP6 =~ ^[0-9A-Fa-f:]+$ ]] || IP6=""
+}
+
+# ========================================================== 4. checks ==
+
+docker_problem() { # <soft> <message...>
+  local soft=$1
+  shift
+  if [[ $soft == soft ]]; then
+    warn "$*"
+  else
+    die "$*"
+  fi
+}
+
+# docker_reachable: the daemon answers. (`docker version` is much faster than
+# `docker info` and is not affected by broken CLI plugins.)
+docker_reachable() { [[ -n $(docker version --format '{{.Server.Version}}' 2>/dev/null || true) ]]; }
+
+# check_docker [soft]: docker installed, daemon reachable, compose v2.
+check_docker() {
+  local soft=${1:-hard} os
+  os=$(uname -s)
+  if ! have docker; then
+    if [[ $os == Darwin ]]; then
+      docker_problem "$soft" "Docker is not installed.
+       Install Docker Desktop (https://www.docker.com/products/docker-desktop/)
+       or OrbStack (https://orbstack.dev), start it, and run this again."
+    else
+      docker_problem "$soft" "Docker is not installed.
+       Install it with:  curl -fsSL https://get.docker.com | sh
+       (see https://docs.docker.com/engine/install/), then run this again."
+    fi
+    return 0
+  fi
+  if ! docker_reachable; then
+    if [[ $os == Darwin ]]; then
+      docker_problem "$soft" "the Docker daemon is not reachable. Start Docker Desktop / OrbStack and try again."
+    else
+      docker_problem "$soft" "the Docker daemon is not reachable.
+       Start it (sudo systemctl start docker), and either run as root or add
+       your user to the docker group: sudo usermod -aG docker \"\$USER\" (then log in again)."
+    fi
+    return 0
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    if [[ $os == Darwin ]]; then
+      docker_problem "$soft" "docker compose v2 is missing. Update Docker Desktop / OrbStack."
+    else
+      docker_problem "$soft" "docker compose v2 is missing (the old docker-compose v1 is not supported).
+       Debian/Ubuntu: sudo apt-get install docker-compose-plugin
+       Fedora/RHEL:   sudo dnf install docker-compose-plugin
+       or reinstall Docker with: curl -fsSL https://get.docker.com | sh"
+    fi
+    return 0
+  fi
+  ok "docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?'), compose $(docker compose version --short 2>/dev/null || echo 'v2')"
+}
+
+# mem_kb: total memory in KiB, or nothing when unknown.
+mem_kb() {
+  case $(uname -s) in
+    Darwin) echo $(($(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024)) ;;
+    *) awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null || true ;;
+  esac
+}
+
+# check_memory <local:true|false> <skip:0|1>
+check_memory() {
+  local kb gib
+  kb=$(mem_kb)
+  if [[ -z $kb || $kb == 0 ]]; then
+    warn "could not determine total memory; Suitehive needs at least 4 GB"
+    return 0
+  fi
+  gib=$(awk -v k="$kb" 'BEGIN { printf "%.1f", k / 1048576 }')
+  if [[ $kb -ge $MIN_MEM_KB ]]; then
+    ok "memory: ${gib} GiB"
+  elif [[ $1 == true || $2 == 1 ]]; then
+    warn "only ${gib} GiB of memory; Suitehive needs about 4 GB (continuing anyway)"
+  else
+    die "only ${gib} GiB of memory; Suitehive needs at least 4 GB.
+       Use a bigger server, or pass --skip-checks to try anyway."
+  fi
+}
+
+# listening_ports: every listening TCP port, one per line ("" + rc 2 if no tool).
+# One awk handles ss, lsof and Linux/macOS/Windows netstat: the first field that
+# looks like <address>:<port> or <address>.<port> is the local address.
+listening_ports() {
+  local raw
+  if have ss; then
+    raw=$(ss -ltn 2>/dev/null | tail -n +2)
+  elif have lsof; then
+    raw=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | tail -n +2)
+  elif have netstat; then
+    raw=$(netstat -an 2>/dev/null | grep -i 'listen')
+  else
+    return 2
+  fi
+  printf '%s\n' "$raw" | awk '{
+    for (i = 1; i <= NF; i++) if ($i ~ /[.:][0-9]+$/ && $i ~ /[.:*]/) {
+      n = split($i, parts, /[.:]/); print parts[n]; break
+    }
+  }' | sort -u
+}
+
+# check_ports <ports...>: warn about ports that something already listens on.
+check_ports() {
+  local p taken="" listening
+  listening=$(listening_ports) || {
+    warn "cannot check ports (no ss, lsof or netstat)"
+    return 0
+  }
+  for p in "$@"; do
+    if printf '%s\n' "$listening" | grep -qx "$p"; then taken="$taken $p"; fi
+  done
+  if [[ -n $taken ]]; then
+    warn "ports already in use:$taken. Stop whatever listens there (another web or mail server?), or 'docker compose up' will fail."
+  else
+    ok "ports free: $*"
+  fi
+}
+
+# ======================================================== 5. commands ==
+
+# ---------------------------------------------------------------- help --
+
+help_main() {
+  cat <<EOF
+${C_BOLD}suitehive${C_RESET} $SUITEHIVE_CLI_VERSION: install and run a self-hosted Suitehive
+(Mail, Calendar, sign-in/SSO and Admin) with Docker.
+
+${C_BOLD}Usage:${C_RESET} suitehive <command> [options]
+
+${C_BOLD}Commands:${C_RESET}
+  install      Set up Suitehive on this server (or --local to try it on a laptop)
+  status       Show containers, health, version and URLs
+  logs         Show service logs (logs [service] [-f])
+  upgrade      Pull new images (or --version X) and restart
+  backup       Write a backup archive (databases, mail blobs, settings)
+  restore      Restore a backup archive
+  dns          Print the DNS records to create, and check them (--check)
+  uninstall    Stop and remove the containers (--purge also deletes data)
+  version      Print the CLI, image and docker compose versions
+  help         Show help for a command: suitehive help <command>
+
+${C_BOLD}Global options:${C_RESET}
+  --dir <path>   Install directory. Default: \$SH_DIR, ./ if it holds an install,
+                 /opt/suitehive as root, ~/suitehive otherwise
+  --yes, -y      Never ask; accept defaults and confirmations
+  -h, --help     Help for the command
+
+Environment: SH_DIR, NO_COLOR, SH_REF / SH_REPO_RAW (where templates come from).
+Docs: https://github.com/Suitehive/suitehive
+EOF
+}
+
+help_install() {
+  cat <<EOF
+${C_BOLD}Usage:${C_RESET} suitehive install [options]
+
+Installs Suitehive into the install directory and starts it: writes .env (with
+freshly generated secrets), docker-compose.yml, Caddyfile and initdb/, pulls the
+images, starts the stack, creates your organization and first admin, and prints
+the DNS records to create.
+
+Asks a few questions when run in a terminal; every answer can also be given as
+a flag (or SH_* environment variable) for unattended installs. Re-running it on
+an existing install keeps the existing secrets and applies new settings.
+
+${C_BOLD}Server install:${C_RESET}
+  --domain <name>          Mail domain, e.g. example.com            (SH_DOMAIN)
+  --hostname <name>        Public hostname [suite.<domain>]         (SH_HOSTNAME)
+  --admin-email <addr>     First admin, on <domain> [admin@<domain>] (SH_ADMIN_EMAIL)
+  --admin-name <name>      Admin display name [Admin]               (SH_ADMIN_NAME)
+  --admin-password <pw>    At least 12 characters. Default: generated and shown
+                           once; never written to disk          (SH_ADMIN_PASSWORD)
+  --org-name <name>        Organization name [from the domain]      (SH_ORG_NAME)
+  --tls-email <addr>       Let's Encrypt account email [admin email] (SH_TLS_EMAIL)
+  --version <tag>          Image tag [$DEFAULT_IMAGE_TAG]                         (SH_VERSION)
+
+${C_BOLD}Modes:${C_RESET}
+  --local                  Try it on a laptop: http://localhost:8080, no TLS, demo
+                           org and users (domain $DEMO_DOMAIN), mail ports
+                           2525/2465/2587/1993
+  --build                  Build the images from source (clones the Suitehive repos
+                           into <dir>/src; needs git)
+
+${C_BOLD}Behavior:${C_RESET}
+  --dir <path>             Install directory (see \`suitehive help\`)
+  --yes, -y                No questions; accept defaults
+  --dry-run                Write all files and show the docker commands, the
+                           setup request (password masked) and the DNS records,
+                           without running anything in Docker
+  --force                  Replace an existing .env, generating NEW secrets (only
+                           for a fresh start: existing data becomes unreadable)
+  --skip-checks            Continue on a server with less than 4 GB of memory
+
+${C_BOLD}Examples:${C_RESET}
+  suitehive install
+  suitehive install --domain example.com --admin-email founder@example.com --yes
+  suitehive install --local
+EOF
+}
+
+help_status() {
+  cat <<EOF
+${C_BOLD}Usage:${C_RESET} suitehive status [--dir <path>]
+
+Shows the install directory, image version and URLs, \`docker compose ps\`, and
+the health of each service (auth via its loopback /healthz, the others via their
+Docker healthchecks).
+EOF
+}
+
+help_logs() {
+  cat <<EOF
+${C_BOLD}Usage:${C_RESET} suitehive logs [service] [-f] [--tail <n>]
+
+Shows the last 200 log lines (or --tail n) of every service, or of one of:
+  ${ALL_SERVICES}
+  -f, --follow    Keep streaming new lines (Ctrl-C to stop)
+EOF
+}
+
+help_upgrade() {
+  cat <<EOF
+${C_BOLD}Usage:${C_RESET} suitehive upgrade [--version <tag>] [--backup] [--yes]
+
+Upgrades a running install:
+  1. offers to take a backup first (--backup: always, --yes without --backup: skip)
+  2. sets SH_VERSION in .env when --version is given
+  3. refreshes docker-compose.yml, Caddyfile and initdb/ from the release
+     (.env is kept; your previous files are kept as .bak)
+  4. pulls the images (for --build installs: git pull in src/ and rebuild)
+  5. restarts changed containers and waits until auth is healthy
+
+Templates come from the branch in \$SH_REF (default main).
+EOF
+}
+
+help_backup() {
+  cat <<EOF
+${C_BOLD}Usage:${C_RESET} suitehive backup [--out <file.tar.gz>]
+
+Writes <dir>/backups/suitehive-YYYYmmdd-HHMMSS.tar.gz (or --out) containing:
+  postgres.sql.gz     pg_dumpall of all Suitehive databases
+  mailblobs.tar.gz    stored message bodies and attachments
+  config/             .env, docker-compose.yml, Caddyfile, initdb/
+
+The stack must be running. The archive contains your secrets (.env) and all
+mail: it is created with mode 600; store it somewhere safe and private.
+EOF
+}
+
+help_restore() {
+  cat <<EOF
+${C_BOLD}Usage:${C_RESET} suitehive restore <file.tar.gz> [--keep-env] [--yes]
+
+Replaces ALL current data with the contents of a backup archive:
+  1. asks you to type the domain to confirm (or --yes)
+  2. restores .env from the archive (current one kept as .env.before-restore-*),
+     unless --keep-env
+  3. stops the app services, recreates the databases and loads the dump
+  4. restores the mail blobs and starts everything again
+
+Works on a fresh server too: point --dir at an empty directory and the
+configuration comes from the archive.
+EOF
+}
+
+help_dns() {
+  cat <<EOF
+${C_BOLD}Usage:${C_RESET} suitehive dns [--check | --no-check] [--token <admin token>]
+
+Prints the DNS records your mail domain needs (A/AAAA, MX, SPF, DMARC,
+autodiscovery SRV, domain verification) and, when dig or nslookup is available,
+looks each one up and marks it found ($G_OK), missing ($G_BAD) or different ($G_NE).
+
+DKIM (sh1._domainkey.<domain>) is generated after the domain is verified. Pass an
+admin API token (--token, or SH_ADMIN_TOKEN) to print it here, or open
+Admin -> Domains.
+
+Set SH_PUBLIC_IP / SH_PUBLIC_IP6 to skip public IP detection (use "none" to
+leave that record out).
+EOF
+}
+
+help_uninstall() {
+  cat <<EOF
+${C_BOLD}Usage:${C_RESET} suitehive uninstall [--purge] [--yes]
+
+Stops and removes the Suitehive containers. Your data (Docker volumes) and the
+install directory are kept, so \`suitehive install\` brings it back.
+
+  --purge   Also delete all data volumes (mail, calendars, accounts, certificates)
+            and the install directory. You must type the domain to confirm (or
+            pass --yes). Take a backup first: suitehive backup
+EOF
+}
+
+help_version() {
+  cat <<EOF
+${C_BOLD}Usage:${C_RESET} suitehive version
+
+Prints the CLI version, the image tag of the install (SH_VERSION in .env) and
+the docker compose version.
+EOF
+}
+
+cmd_help() {
+  local topic=${1:-}
+  case $topic in
+    "") help_main ;;
+    install | status | logs | upgrade | backup | restore | dns | uninstall | version) "help_$topic" ;;
+    help) help_main ;;
+    *) die "no such command: $topic (see suitehive help)" ;;
+  esac
+}
+
+# -------------------------------------------------------------- install --
+
+# slugify <text>: organization slug, ^[a-z0-9-]{3,40}$.
+slugify() {
+  local s
+  s=$(lower "$1" | sed -e 's/[^a-z0-9][^a-z0-9]*/-/g' -e 's/^-*//' -e 's/-*$//')
+  s=${s:0:40}
+  while [[ $s == *- ]]; do s=${s%-}; done
+  if [[ ${#s} -lt 3 ]]; then s="${s:+$s-}org"; fi
+  printf '%s' "$s"
+}
+
+# org_name_from_domain example.com -> Example
+org_name_from_domain() {
+  local label=${1%%.*}
+  printf '%s%s' "$(printf '%s' "${label:0:1}" | tr '[:lower:]' '[:upper:]')" "${label:1}"
+}
+
+valid_domain() {
+  local re='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$'
+  [[ ${#1} -le 253 && $1 =~ $re ]]
+}
+
+# setup_json <password>: the SetupRequest body for POST /api/auth/setup.
+setup_json() {
+  printf '{"orgName":"%s","orgSlug":"%s","domain":"%s","admin":{"displayName":"%s","localPart":"%s","password":"%s"}}' \
+    "$(json_escape "$ORG_NAME")" "$(json_escape "$ORG_SLUG")" "$(json_escape "$DOMAIN")" \
+    "$(json_escape "$ADMIN_NAME")" "$(json_escape "${ADMIN_EMAIL%@*}")" "$(json_escape "$1")"
+}
+
+# write_env: (re)write <dir>/.env with mode 600. Keys the CLI does not manage
+# are carried over from the previous file.
+write_env() {
+  local file=$DIR/.env tmp
+  tmp=$(umask 077 && mktemp "$DIR/.env.XXXXXX")
+  {
+    cat <<EOF
+# Suitehive settings, written by \`suitehive install\` ($SUITEHIVE_CLI_VERSION) on $(date -u '+%Y-%m-%d %H:%M UTC').
+# Every key is documented in templates/env.example in the suitehive repo.
+# Keep this file private (mode 600): it contains your secrets. Back it up.
+
+# Release (image tag of ghcr.io/suitehive/*)
+SH_VERSION=$(env_quote "$IMAGE_TAG")
+
+# Identity
+SH_DOMAIN=$(env_quote "$DOMAIN")
+SH_HOSTNAME=$(env_quote "$SITE_HOST")
+SH_PUBLIC_URL=$(env_quote "$PUBLIC_URL")
+SH_SITE_ADDRESS=$(env_quote "$SITE_ADDRESS")
+SH_TLS_EMAIL=$(env_quote "$TLS_EMAIL")
+SH_ORG_NAME=$(env_quote "$ORG_NAME")
+SH_ORG_SLUG=$(env_quote "$ORG_SLUG")
+SH_ADMIN_EMAIL=$(env_quote "$ADMIN_EMAIL")
+SH_ADMIN_NAME=$(env_quote "$ADMIN_NAME")
+EOF
+    if [[ -n $VERIFY_NAME ]]; then
+      printf 'SH_VERIFY_TXT_NAME=%s\nSH_VERIFY_TXT_VALUE=%s\n' "$(env_quote "$VERIFY_NAME")" "$(env_quote "$VERIFY_VALUE")"
+    fi
+    cat <<EOF
+
+# Mode
+SH_LOCAL=$LOCAL
+SH_BUILD=$BUILD
+
+# Host ports (SH_AUTH_LOCAL_PORT is bound to 127.0.0.1 only)
+SH_HTTP_PORT=$HTTP_PORT
+SH_HTTPS_PORT=$HTTPS_PORT
+SH_SMTP_PORT=$SMTP_PORT
+SH_SMTPS_PORT=$SMTPS_PORT
+SH_SUBMISSION_PORT=$SUBMISSION_PORT
+SH_IMAPS_PORT=$IMAPS_PORT
+SH_AUTH_LOCAL_PORT=$AUTH_PORT
+
+# Development flags (keep false on a public server)
+SH_DEV_SEED=$DEV_FLAGS
+SH_DEV_INSECURE_COOKIES=$DEV_FLAGS
+SH_LOG_LEVEL=$(env_quote "$LOG_LEVEL")
+
+# Secrets: generated once. Do not change them on a running install.
+SH_MASTER_KEY=$MASTER_KEY
+SH_POSTGRES_PASSWORD=$PG_PASSWORD
+SH_MAIL_CLIENT_SECRET=$MAIL_SECRET
+SH_CALENDAR_CLIENT_SECRET=$CAL_SECRET
+EOF
+    # Carry over settings the CLI does not manage (e.g. COMPOSE_PROJECT_NAME).
+    if [[ -f $file ]]; then
+      local line key extra="" known
+      known=$(printf '%s' "$KNOWN_ENV_KEYS" | tr '\n' ' ')
+      while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%$'\r'}
+        [[ $line =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+        key=${line%%=*}
+        case " $known " in *" $key "*) continue ;; esac
+        extra="$extra$line"$'\n'
+      done <"$file"
+      if [[ -n $extra ]]; then
+        printf '\n# Your own settings (kept from the previous .env)\n%s' "$extra"
+      fi
+    fi
+  } >"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$file"
+}
+
+# prepare_build: clone/update the service repos into <dir>/src and write the
+# workspace files their Dockerfiles expect.
+prepare_build() {
+  local src=$DIR/src repo svc missing=""
+  mkdir -p "$src"
+  for repo in $BUILD_REPOS; do
+    if [[ -d $src/$repo/.git ]]; then
+      run git -C "$src/$repo" pull --ff-only --quiet
+    else
+      run git clone --depth 1 --quiet "$GIT_BASE/$repo.git" "$src/$repo"
+    fi
+  done
+  fetch_template build/go.work "$src/go.work"
+  fetch_template build/package.json "$src/package.json"
+  if [[ $DRY_RUN == 1 ]]; then
+    note "(dry run: Dockerfiles are checked when the repos are cloned)"
+    return 0
+  fi
+  for svc in $APP_SERVICES; do
+    [[ -f $src/$svc/Dockerfile ]] || missing="$missing $svc/Dockerfile"
+  done
+  [[ -z $missing ]] || die "cannot build from source: missing$missing in $src.
+       The service repos at $GIT_BASE do not ship Dockerfiles yet; install the
+       published images instead (without --build)."
+  ok "sources ready in $src"
+}
+
+# run_setup: first-time setup through auth's loopback port. Sets SETUP_RESULT to
+# created | already | dry | manual | failed.
+run_setup() {
+  local base="http://127.0.0.1:$AUTH_PORT" body tmp code tok vr i
+  SETUP_RESULT=failed
+  if [[ $DRY_RUN == 1 ]]; then
+    dry "GET  $base/api/auth/setup        (continue only if {\"available\":true})"
+    dry "GET  $base/api/auth/csrf         (-> token)"
+    dry "POST $base/api/auth/setup  X-CSRF: <token>, Cookie: __Host-sh_csrf=<token>; sh_csrf=<token>"
+    dry "     $(setup_json '********')"
+    SETUP_RESULT=dry
+    return 0
+  fi
+  if ! have curl; then
+    warn "curl is not installed, so setup cannot run from here."
+    SETUP_RESULT=manual
+    return 0
+  fi
+  tmp=$(mktemp)
+  on_exit_remove "$tmp"
+
+  # Is setup still open? Retry briefly: /healthz can answer before migrations finish.
+  code=000
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    code=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 10 "$base/api/auth/setup" 2>/dev/null) || code=000
+    [[ $code == 200 ]] && break
+    sleep 3
+  done
+  if [[ $code != 200 ]]; then
+    warn "GET /api/auth/setup answered HTTP $code."
+    SETUP_RESULT=manual
+    return 0
+  fi
+  if ! json_true available "$tmp"; then
+    SETUP_RESULT=already
+    return 0
+  fi
+
+  # Double-submit CSRF: the X-CSRF header must equal the CSRF cookie. Both
+  # cookie names are sent: __Host-sh_csrf (HTTPS) and sh_csrf (dev, plain http).
+  tok=""
+  if curl -fsS -o "$tmp" --max-time 10 "$base/api/auth/csrf" 2>/dev/null; then
+    tok=$(json_str "$tmp" '.token' token)
+  fi
+  if [[ -z $tok ]]; then tok=$(rand_alnum 32); fi
+
+  # The body (with the password) goes through stdin, not the command line.
+  body=$(setup_json "$ADMIN_PASSWORD")
+  code=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 60 -X POST \
+    -H 'Content-Type: application/json' -H 'Accept: application/json' \
+    -H "X-CSRF: $tok" -H "Cookie: __Host-sh_csrf=$tok; sh_csrf=$tok" \
+    --data-binary @- "$base/api/auth/setup" <<<"$body" 2>/dev/null) || code=000
+  body=""
+
+  case $code in
+    200 | 201)
+      SETUP_RESULT=created
+      if have jq; then
+        VERIFY_NAME=$(jq -r '.domain.verificationRecord.name // empty' "$tmp" 2>/dev/null || true)
+        VERIFY_VALUE=$(jq -r '.domain.verificationRecord.value // empty' "$tmp" 2>/dev/null || true)
+      else
+        vr=$(tr -d '\n' <"$tmp" | sed -n 's/.*"verificationRecord"[[:space:]]*:[[:space:]]*{\([^}]*\)}.*/\1/p')
+        VERIFY_NAME=$(printf '%s' "$vr" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        VERIFY_VALUE=$(printf '%s' "$vr" | sed -n 's/.*"value"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      fi
+      VERIFY_NAME=${VERIFY_NAME%.}
+      if [[ -n $VERIFY_NAME && -n $VERIFY_VALUE ]]; then
+        env_set SH_VERIFY_TXT_NAME "$VERIFY_NAME"
+        env_set SH_VERIFY_TXT_VALUE "$VERIFY_VALUE"
+      fi
+      ok "created organization \"$ORG_NAME\" and admin $ADMIN_EMAIL"
+      ;;
+    409)
+      SETUP_RESULT=already
+      ;;
+    *)
+      if grep -q 'auth.setup.already_completed' "$tmp" 2>/dev/null; then
+        SETUP_RESULT=already
+      else
+        warn "setup failed (HTTP $code): $(head -c 400 "$tmp" 2>/dev/null)"
+        SETUP_RESULT=manual
+      fi
+      ;;
+  esac
+}
+
+# dns_records: one "TYPE|NAME|VALUE" line per record the domain needs.
+dns_records() {
+  printf 'A|%s|%s\n' "$SITE_HOST" "$(pick "$IP4" "<your server IPv4>")"
+  if [[ -n $IP6 ]]; then printf 'AAAA|%s|%s\n' "$SITE_HOST" "$IP6"; fi
+  printf 'MX|%s|10 %s.\n' "$DOMAIN" "$SITE_HOST"
+  printf 'TXT|%s|v=spf1 mx -all\n' "$DOMAIN"
+  printf 'TXT|_dmarc.%s|v=DMARC1; p=quarantine; rua=mailto:postmaster@%s\n' "$DOMAIN" "$DOMAIN"
+  printf 'SRV|_imaps._tcp.%s|0 1 993 %s.\n' "$DOMAIN" "$SITE_HOST"
+  printf 'SRV|_submissions._tcp.%s|0 1 465 %s.\n' "$DOMAIN" "$SITE_HOST"
+  printf 'SRV|_caldavs._tcp.%s|0 1 443 %s.\n' "$DOMAIN" "$SITE_HOST"
+  printf 'TXT|_caldavs._tcp.%s|path=/dav/calendars/\n' "$DOMAIN"
+  if [[ -n $VERIFY_NAME && -n $VERIFY_VALUE ]]; then
+    printf 'TXT|%s|%s\n' "$VERIFY_NAME" "$VERIFY_VALUE"
+  fi
+}
+
+# dns_lookup <type> <name>: one normalized value per line: lowercase hostnames
+# with a trailing dot, TXT strings unquoted and joined. dig is preferred; the
+# nslookup output is parsed best-effort (Unix and Windows formats).
+dns_lookup() {
+  local type=$1 name=$2 out
+  if have dig; then
+    out=$(dig +short +time=3 +tries=1 "$type" "$name" 2>/dev/null </dev/null | grep -v '^;' || true)
+  else
+    out=$(nslookup -type="$type" "$name" 2>/dev/null </dev/null || true)
+    case $type in
+      A | AAAA)
+        out=$(printf '%s\n' "$out" | awk '/^Name:/ { f = 1; next } f && /^Address/ { print $NF }')
+        ;;
+      MX)
+        out=$(printf '%s\n' "$out" | awk '
+          /MX preference/ {
+            p = $0; sub(/.*MX preference = /, "", p); sub(/,.*/, "", p)
+            h = $0; sub(/.*mail exchanger = /, "", h); print p " " h; next
+          }
+          /mail exchanger = / { sub(/.*mail exchanger = /, ""); print }')
+        ;;
+      TXT)
+        out=$(printf '%s\n' "$out" | awk '/text = / { sub(/.*text = /, ""); print; next } /^[ \t]+"/ { print }' |
+          sed -e 's/^[[:space:]]*//')
+        ;;
+      SRV)
+        out=$(printf '%s\n' "$out" | awk '/service = / { sub(/.*service = /, ""); print }')
+        ;;
+    esac
+  fi
+  [[ -n $out ]] || return 0
+  case $type in
+    TXT) printf '%s\n' "$out" | tr -d '\r' | sed -e 's/" "//g' -e 's/^"//' -e 's/"$//' ;;
+    MX | SRV) printf '%s\n' "$out" | tr -d '\r' | tr '[:upper:]' '[:lower:]' | sed -e 's/\([a-z0-9-]\)$/\1./' ;;
+    *) printf '%s\n' "$out" | tr -d '\r' | tr '[:upper:]' '[:lower:]' ;;
+  esac
+}
+
+# dns_status <type> <name> <expected>: prints "ok|missing|mismatch<TAB>found".
+dns_status() {
+  local type=$1 name=$2 expected=$3 found want hit=no related="" f
+  found=$(dns_lookup "$type" "$name")
+  want=$expected
+  case $type in MX | SRV | A | AAAA) want=$(lower "$expected") ;; esac
+  if [[ -n $found ]]; then
+    while IFS= read -r f; do
+      [[ -n $f ]] || continue
+      case $type in
+        A | AAAA) if [[ $expected == "<"* || $f == "$want" ]]; then hit=yes; fi ;;
+        TXT)
+          if [[ $f == "$want" ]]; then hit=yes; fi
+          # Any DMARC policy counts: p=none/quarantine/reject are all valid choices.
+          if [[ $want == v=DMARC1* && $f == v=DMARC1* ]]; then hit=yes; fi
+          # Other TXT strings on the same name (site verifications...) are unrelated.
+          if [[ $want == v=spf1* && $f == v=spf1* ]]; then related="$related $f"; fi
+          ;;
+        *) if [[ $f == "$want" ]]; then hit=yes; fi ;;
+      esac
+    done <<<"$found"
+  fi
+  if [[ $hit == yes ]]; then
+    printf 'ok\t'
+  elif [[ -z $found || ($type == TXT && -z $related) ]]; then
+    printf 'missing\t'
+  elif [[ $type == TXT ]]; then
+    printf 'mismatch\t%s' "$(printf '%s' "${related# }" | cut -c1-70)"
+  else
+    printf 'mismatch\t%s' "$(printf '%s' "$found" | tr '\n' ' ' | cut -c1-70)"
+  fi
+}
+
+# print_dns_table [check]: the records table, optionally with lookups.
+print_dns_table() {
+  local check=${1:-} records w1=4 w2=4 type name value st found mark
+  records=$(dns_records)
+  while IFS='|' read -r type name value; do
+    if [[ ${#name} -gt $w2 ]]; then w2=${#name}; fi
+  done <<<"$records"
+  printf '  %s%-*s  %-*s  %s%s\n' "$C_DIM" "$w1" TYPE "$w2" NAME VALUE "$C_RESET"
+  while IFS='|' read -r type name value; do
+    if [[ -n $check ]]; then
+      st=$(dns_status "$type" "$name" "$value")
+      found=${st#*$'\t'}
+      case ${st%%$'\t'*} in
+        ok) mark="${C_GREEN}${G_OK} found${C_RESET}" ;;
+        missing) mark="${C_RED}${G_BAD} missing${C_RESET}" ;;
+        *) mark="${C_YELLOW}${G_NE} found: ${found}${C_RESET}" ;;
+      esac
+      printf '  %-*s  %-*s  %s\n' "$w1" "$type" "$w2" "$name" "$value"
+      printf '  %-*s  %-*s  %s\n' "$w1" "" "$w2" "" "$mark"
+    else
+      printf '  %-*s  %-*s  %s\n' "$w1" "$type" "$w2" "$name" "$value"
+    fi
+  done <<<"$records"
+}
+
+dns_notes() {
+  note "Names are fully qualified. In most DNS panels enter only the part before"
+  note ".$DOMAIN (or @ for $DOMAIN itself)."
+  if [[ -z $VERIFY_NAME ]]; then
+    note "The domain-verification TXT record is shown in Admin -> Domains."
+  fi
+  note "DKIM (sh1._domainkey.$DOMAIN) is generated after the domain verifies:"
+  note "run \`suitehive dns\` again or open Admin -> Domains."
+  note "Also: set reverse DNS (PTR) of $(pick "$IP4" "your server IP") to $SITE_HOST at your"
+  note "VPS provider, and make sure outbound port 25 is open (many providers block it)."
+}
+
+cmd_install() {
+  local opt_domain="" opt_host="" opt_admin_email="" opt_admin_name="" opt_admin_pw=""
+  local opt_org="" opt_tls="" opt_version="" opt_local=0 opt_build=0 opt_force=0 opt_skip=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --domain) need_value "$@"; opt_domain=$2; shift 2 ;;
+      --hostname) need_value "$@"; opt_host=$2; shift 2 ;;
+      --admin-email) need_value "$@"; opt_admin_email=$2; shift 2 ;;
+      --admin-name) need_value "$@"; opt_admin_name=$2; shift 2 ;;
+      --admin-password) need_value "$@"; opt_admin_pw=$2; shift 2 ;;
+      --org-name) need_value "$@"; opt_org=$2; shift 2 ;;
+      --tls-email) need_value "$@"; opt_tls=$2; shift 2 ;;
+      --version) need_value "$@"; opt_version=$2; shift 2 ;;
+      --local) opt_local=1; shift ;;
+      --build) opt_build=1; shift ;;
+      --force) opt_force=1; shift ;;
+      --skip-checks) opt_skip=1; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      *) die "unknown option for install: $1 (see suitehive help install)" ;;
+    esac
+  done
+
+  resolve_dir
+  local had_env=0 had_secrets=0
+  if [[ -f $DIR/.env ]]; then had_env=1; fi
+
+  header "Suitehive installer"
+  if [[ $DRY_RUN == 1 ]]; then note "dry run: files are written, nothing is started"; fi
+
+  # ---- settings: flag > SH_* environment > existing .env > question/default
+  LOCAL=false
+  if [[ $opt_local == 1 || ${SH_LOCAL:-} == true || $(prev SH_LOCAL) == true ]]; then LOCAL=true; fi
+  BUILD=false
+  if [[ $opt_build == 1 || ${SH_BUILD:-} == true || $(prev SH_BUILD) == true ]]; then BUILD=true; fi
+  if [[ $BUILD == true ]]; then
+    IMAGE_TAG=$(pick "$opt_version" "${SH_VERSION:-}" "$(prev SH_VERSION)" "$BUILD_IMAGE_TAG")
+  else
+    IMAGE_TAG=$(pick "$opt_version" "${SH_VERSION:-}" "$(prev SH_VERSION)" "$DEFAULT_IMAGE_TAG")
+  fi
+  LOG_LEVEL=$(pick "${SH_LOG_LEVEL:-}" "$(prev SH_LOG_LEVEL)" info)
+  AUTH_PORT=$(pick "${SH_AUTH_LOCAL_PORT:-}" "$(prev SH_AUTH_LOCAL_PORT)" 8081)
+  VERIFY_NAME=$(prev SH_VERIFY_TXT_NAME)
+  VERIFY_VALUE=$(prev SH_VERIFY_TXT_VALUE)
+  ADMIN_PASSWORD=""
+  PASSWORD_GENERATED=0
+
+  if [[ $LOCAL == true ]]; then
+    if [[ -n $opt_domain$opt_host$opt_admin_email ]]; then
+      warn "--local always uses the demo domain $DEMO_DOMAIN on http://localhost; ignoring --domain/--hostname/--admin-email"
+    fi
+    DOMAIN=$DEMO_DOMAIN
+    SITE_HOST=localhost
+    ADMIN_EMAIL=admin@$DEMO_DOMAIN
+    ADMIN_NAME=Admin
+    ORG_NAME=Demo
+    ORG_SLUG=demo
+    HTTP_PORT=$(pick "${SH_HTTP_PORT:-}" "$(prev SH_HTTP_PORT)" 8080)
+    HTTPS_PORT=$(pick "${SH_HTTPS_PORT:-}" "$(prev SH_HTTPS_PORT)" 8443)
+    SMTP_PORT=$(pick "${SH_SMTP_PORT:-}" "$(prev SH_SMTP_PORT)" 2525)
+    SMTPS_PORT=$(pick "${SH_SMTPS_PORT:-}" "$(prev SH_SMTPS_PORT)" 2465)
+    SUBMISSION_PORT=$(pick "${SH_SUBMISSION_PORT:-}" "$(prev SH_SUBMISSION_PORT)" 2587)
+    IMAPS_PORT=$(pick "${SH_IMAPS_PORT:-}" "$(prev SH_IMAPS_PORT)" 1993)
+    PUBLIC_URL="http://localhost:$HTTP_PORT"
+    SITE_ADDRESS=":80"
+    TLS_EMAIL=admin@$DEMO_DOMAIN
+    DEV_FLAGS=true
+  else
+    DOMAIN=$(lower "$(pick "$opt_domain" "${SH_DOMAIN:-}" "$(prev SH_DOMAIN)")")
+    if [[ -z $opt_domain && -z ${SH_DOMAIN:-} ]]; then
+      if tty_ready; then
+        printf '\n'
+        info "A few questions (Enter accepts the [default]):"
+      fi
+      ask DOMAIN "Mail domain (addresses will be name@<domain>)" "$DOMAIN"
+      DOMAIN=$(lower "$DOMAIN")
+    fi
+    [[ -n $DOMAIN ]] || die "a mail domain is required: pass --domain example.com (or --local to try Suitehive on this machine)"
+    DOMAIN=${DOMAIN%.}
+    valid_domain "$DOMAIN" || die "\"$DOMAIN\" is not a valid domain name (use the ASCII/punycode form, e.g. example.com)"
+    case $DOMAIN in *.local | *.localhost | *.test | *.example | *.invalid)
+      warn "$DOMAIN is not a public domain; certificates and mail delivery will not work (use --local for a trial)" ;;
+    esac
+
+    SITE_HOST=$(lower "$(pick "$opt_host" "${SH_HOSTNAME:-}" "$(prev SH_HOSTNAME)")")
+    if [[ -z $opt_host && -z ${SH_HOSTNAME:-} ]]; then
+      ask SITE_HOST "Public hostname for web, IMAP and SMTP" "$(pick "$SITE_HOST" "suite.$DOMAIN")"
+    fi
+    SITE_HOST=$(lower "$(pick "$SITE_HOST" "suite.$DOMAIN")")
+    SITE_HOST=${SITE_HOST%.}
+    valid_domain "$SITE_HOST" || die "\"$SITE_HOST\" is not a valid hostname"
+
+    ADMIN_EMAIL=$(pick "$opt_admin_email" "${SH_ADMIN_EMAIL:-}" "$(prev SH_ADMIN_EMAIL)")
+    if [[ -z $opt_admin_email && -z ${SH_ADMIN_EMAIL:-} ]]; then
+      ask ADMIN_EMAIL "First admin's email address" "$(pick "$ADMIN_EMAIL" "admin@$DOMAIN")"
+    fi
+    ADMIN_EMAIL=$(pick "$ADMIN_EMAIL" "admin@$DOMAIN")
+    local admin_domain admin_local
+    admin_domain=$(lower "${ADMIN_EMAIL##*@}")
+    admin_local=${ADMIN_EMAIL%@*}
+    [[ $ADMIN_EMAIL == *@* && $admin_domain == "$DOMAIN" ]] ||
+      die "the admin address must be on $DOMAIN (got \"$ADMIN_EMAIL\"); for example admin@$DOMAIN"
+    [[ $admin_local =~ ^[A-Za-z0-9._%+-]{1,64}$ && $admin_local != .* && $admin_local != *. ]] ||
+      die "\"$admin_local\" is not a valid mailbox name (letters, digits, . _ % + -)"
+    ADMIN_EMAIL="$admin_local@$DOMAIN"
+
+    ADMIN_NAME=$(pick "$opt_admin_name" "${SH_ADMIN_NAME:-}" "$(prev SH_ADMIN_NAME)")
+    if [[ -z $opt_admin_name && -z ${SH_ADMIN_NAME:-} ]]; then
+      ask ADMIN_NAME "Admin's display name" "$(pick "$ADMIN_NAME" Admin)"
+    fi
+    ADMIN_NAME=$(pick "$ADMIN_NAME" Admin)
+
+    ORG_NAME=$(pick "$opt_org" "${SH_ORG_NAME:-}" "$(prev SH_ORG_NAME)")
+    if [[ -z $opt_org && -z ${SH_ORG_NAME:-} ]]; then
+      ask ORG_NAME "Organization name" "$(pick "$ORG_NAME" "$(org_name_from_domain "$DOMAIN")")"
+    fi
+    ORG_NAME=$(pick "$ORG_NAME" "$(org_name_from_domain "$DOMAIN")")
+    [[ ${#ORG_NAME} -le 120 ]] || die "organization name is longer than 120 characters"
+    ORG_SLUG=$(slugify "$ORG_NAME")
+
+    TLS_EMAIL=$(pick "$opt_tls" "${SH_TLS_EMAIL:-}" "$(prev SH_TLS_EMAIL)" "$ADMIN_EMAIL")
+    [[ $TLS_EMAIL == ?*@?*.?* ]] || die "\"$TLS_EMAIL\" is not a valid email address for --tls-email"
+
+    HTTP_PORT=$(pick "${SH_HTTP_PORT:-}" "$(prev SH_HTTP_PORT)" 80)
+    HTTPS_PORT=$(pick "${SH_HTTPS_PORT:-}" "$(prev SH_HTTPS_PORT)" 443)
+    SMTP_PORT=$(pick "${SH_SMTP_PORT:-}" "$(prev SH_SMTP_PORT)" 25)
+    SMTPS_PORT=$(pick "${SH_SMTPS_PORT:-}" "$(prev SH_SMTPS_PORT)" 465)
+    SUBMISSION_PORT=$(pick "${SH_SUBMISSION_PORT:-}" "$(prev SH_SUBMISSION_PORT)" 587)
+    IMAPS_PORT=$(pick "${SH_IMAPS_PORT:-}" "$(prev SH_IMAPS_PORT)" 993)
+    PUBLIC_URL="https://$SITE_HOST"
+    if [[ $HTTPS_PORT != 443 ]]; then PUBLIC_URL="$PUBLIC_URL:$HTTPS_PORT"; fi
+    SITE_ADDRESS=$(pick "${SH_SITE_ADDRESS:-}" "$SITE_HOST")
+    DEV_FLAGS=false
+
+    # The admin password is only needed for first-time setup; never stored.
+    ADMIN_PASSWORD=$(pick "$opt_admin_pw" "${SH_ADMIN_PASSWORD:-}")
+    if [[ -z $ADMIN_PASSWORD ]] && tty_ready; then
+      local again=""
+      ask_secret ADMIN_PASSWORD "Admin password (min. 12 characters; Enter to generate one)"
+      if [[ -n $ADMIN_PASSWORD ]]; then
+        [[ ${#ADMIN_PASSWORD} -ge 12 ]] || die "the admin password must be at least 12 characters"
+        ask_secret again "Repeat the password"
+        [[ $again == "$ADMIN_PASSWORD" ]] || die "the passwords do not match"
+      fi
+    fi
+    if [[ -z $ADMIN_PASSWORD ]]; then
+      ADMIN_PASSWORD=$(rand_password)
+      PASSWORD_GENERATED=1
+    fi
+    [[ ${#ADMIN_PASSWORD} -ge 12 ]] || die "the admin password must be at least 12 characters"
+  fi
+
+  # ---- confirm the plan
+  printf '\n'
+  kv "Directory" "$DIR"
+  if [[ $LOCAL == true ]]; then
+    kv "Mode" "local trial (demo data, plain HTTP)"
+  else
+    kv "Domain" "$DOMAIN"
+    kv "Hostname" "$SITE_HOST"
+    kv "Admin" "$ADMIN_NAME <$ADMIN_EMAIL>"
+    kv "Organization" "$ORG_NAME ($ORG_SLUG)"
+  fi
+  kv "URL" "$PUBLIC_URL"
+  kv "Images" "ghcr.io/suitehive/*:$IMAGE_TAG$([[ $BUILD == true ]] && echo ' (built from source)')"
+  printf '\n'
+  if tty_ready; then
+    confirm "Continue?" y || die "cancelled; nothing was changed"
+  fi
+
+  # ---- 1. preflight
+  step "Checking prerequisites"
+  if [[ $DRY_RUN == 1 ]]; then check_docker soft; else check_docker; fi
+  if ! have openssl && ! have base64; then die "openssl or base64 is required to generate secrets"; fi
+  if ! have curl; then warn "curl is not installed: the health check and first-time setup need it"; fi
+  if [[ $BUILD == true ]] && ! have git; then die "--build needs git"; fi
+  if [[ ${SH_PREFLIGHT_DONE:-} != 1 ]]; then
+    check_memory "$LOCAL" "$opt_skip"
+    if [[ $DRY_RUN == 0 && -f $DIR/docker-compose.yml ]] && stack_running; then
+      note "Suitehive is already running here; skipping the port check"
+    elif [[ $LOCAL == true ]]; then
+      check_ports "$HTTP_PORT" "$HTTPS_PORT" "$AUTH_PORT"
+    else
+      check_ports "$HTTP_PORT" "$HTTPS_PORT" "$SMTP_PORT" "$SMTPS_PORT" "$SUBMISSION_PORT" "$IMAPS_PORT" "$AUTH_PORT"
+    fi
+  fi
+
+  # ---- 2. secrets: keep existing ones unless --force
+  step "Generating secrets"
+  MASTER_KEY="" PG_PASSWORD="" MAIL_SECRET="" CAL_SECRET=""
+  if [[ $had_env == 1 && $opt_force == 0 ]]; then
+    MASTER_KEY=$(prev SH_MASTER_KEY)
+    PG_PASSWORD=$(prev SH_POSTGRES_PASSWORD)
+    MAIL_SECRET=$(prev SH_MAIL_CLIENT_SECRET)
+    CAL_SECRET=$(prev SH_CALENDAR_CLIENT_SECRET)
+    if [[ -n $MASTER_KEY$PG_PASSWORD ]]; then had_secrets=1; fi
+  elif [[ $had_env == 1 ]]; then
+    warn "--force: replacing $DIR/.env with NEW secrets."
+    if [[ $DRY_RUN == 0 ]] && have docker && [[ -n $(docker volume ls -q --filter "label=com.docker.compose.project=$(project_name)" --filter label=com.docker.compose.volume=pgdata 2>/dev/null) ]]; then
+      warn "a Suitehive database volume already exists. With new secrets its data can no longer be"
+      warn "opened. Only continue for a fresh start (\`suitehive uninstall --purge\` first is cleaner)."
+      confirm "Replace the secrets anyway?" n || die "cancelled; nothing was changed"
+    fi
+    cp -p "$DIR/.env" "$DIR/.env.before-force"
+    note "previous .env kept as .env.before-force"
+  fi
+  if [[ -z $MASTER_KEY ]]; then MASTER_KEY=$(rand_b64 32); fi
+  if [[ -z $PG_PASSWORD ]]; then PG_PASSWORD=$(rand_alnum 32); fi
+  if [[ -z $MAIL_SECRET ]]; then MAIL_SECRET=$(rand_alnum 40); fi
+  if [[ -z $CAL_SECRET ]]; then CAL_SECRET=$(rand_alnum 40); fi
+  if [[ $had_secrets == 1 ]]; then
+    ok "kept the existing secrets from .env"
+  else
+    ok "master key, database password and service credentials generated"
+  fi
+
+  # ---- 3. files
+  step "Writing configuration to $DIR"
+  mkdir -p "$DIR" "$DIR/initdb" "$DIR/backups"
+  chmod 700 "$DIR/backups" 2>/dev/null || true
+  note "templates: $(templates_source)"
+  install_templates
+  write_env
+  ok ".env (mode 600), docker-compose.yml, Caddyfile, initdb/"
+
+  if [[ $BUILD == true ]]; then
+    step "Preparing sources for --build"
+    prepare_build
+  fi
+
+  # ---- 4. start
+  if [[ $BUILD == true ]]; then
+    step "Building images (this takes a while the first time)"
+    compose_run pull $INFRA_SERVICES
+    compose_run build $APP_SERVICES
+  else
+    step "Pulling images"
+    compose_run pull
+  fi
+  step "Starting Suitehive"
+  compose_run up -d --remove-orphans
+
+  # ---- 5. health
+  step "Waiting for Suitehive to start"
+  local healthy=1
+  wait_for_auth || healthy=0
+
+  # ---- 6. first-time setup (the demo org is seeded in local mode)
+  SETUP_RESULT=skipped
+  if [[ $LOCAL == false ]]; then
+    step "Creating your organization and admin account"
+    if [[ $healthy == 1 ]]; then
+      run_setup
+    else
+      SETUP_RESULT=manual
+    fi
+  fi
+
+  # ---- 7. summary
+  print_install_summary "$healthy"
+}
+
+print_install_summary() {
+  local healthy=$1 u
+  printf '\n'
+  if [[ $DRY_RUN == 1 ]]; then
+    header "Dry run complete: configuration written to $DIR, nothing started."
+  elif [[ $healthy == 1 ]]; then
+    header "${C_GREEN}${G_OK}${C_RESET}${C_BOLD} Suitehive is running."
+  else
+    header "${C_YELLOW}Suitehive was started but is not healthy yet.${C_RESET}"
+  fi
+  printf '\n'
+  kv "Mail" "$PUBLIC_URL/mail"
+  kv "Calendar" "$PUBLIC_URL/calendar"
+  kv "Admin" "$PUBLIC_URL/admin"
+  kv "Install dir" "$DIR"
+  kv "Version" "$IMAGE_TAG"
+  printf '\n'
+
+  if [[ $LOCAL == true ]]; then
+    header "Demo sign-in (password: $DEMO_PASSWORD)"
+    for u in $DEMO_USERS; do kv "" "$u@$DEMO_DOMAIN"; done
+    printf '\n'
+    note "Mail clients: IMAP localhost:$IMAPS_PORT (TLS, self-signed), SMTP localhost:$SUBMISSION_PORT"
+    note "This trial uses plain HTTP and demo data: do not expose it to the internet."
+  else
+    header "Admin sign-in"
+    kv "Email" "$ADMIN_EMAIL"
+    case $SETUP_RESULT in
+      created)
+        if [[ $PASSWORD_GENERATED == 1 ]]; then
+          kv "Password" "${C_BOLD}${ADMIN_PASSWORD}${C_RESET}"
+          printf '  %s%-13s save this password now: it is shown only once and stored nowhere.%s\n' "$C_YELLOW" "" "$C_RESET"
+        else
+          kv "Password" "(the one you chose)"
+        fi
+        note "You will be asked to set up two-factor authentication at first sign-in."
+        ;;
+      already)
+        note "First-time setup had already been completed: sign in with your existing admin account."
+        ;;
+      dry)
+        if [[ $PASSWORD_GENERATED == 1 ]]; then
+          kv "Password" "(generated during the real install and shown once)"
+        else
+          kv "Password" "(the one you chose)"
+        fi
+        ;;
+      *)
+        note "Setup did not finish from the command line. Open $PUBLIC_URL/setup"
+        note "to create the organization and admin in the browser (once DNS and TLS work),"
+        note "or re-run \`suitehive install\` after checking \`suitehive logs auth\`."
+        ;;
+    esac
+    printf '\n'
+    header "DNS records for $DOMAIN"
+    public_ips
+    print_dns_table
+    printf '\n'
+    dns_notes
+  fi
+  printf '\n'
+  note "Next: suitehive status | suitehive logs [service] | suitehive dns --check | suitehive backup"
+  ADMIN_PASSWORD=""
+}
+
+# ---------------------------------------------------------------- status --
+
+cmd_status() {
+  [[ $# -eq 0 ]] || die "unknown option for status: $1"
+  require_install
+  local svc cid state mark ver="" running=0
+  header "Suitehive"
+  kv "Install dir" "$DIR"
+  kv "Version" "$IMAGE_TAG$([[ $BUILD == true ]] && echo ' (built from source)')"
+  kv "Mode" "$([[ $LOCAL == true ]] && echo 'local trial' || echo 'server')"
+  kv "URL" "$PUBLIC_URL/mail, /calendar, /admin"
+  printf '\n'
+  if ! have docker || ! docker_reachable; then
+    warn "Docker is not reachable, so container status is unknown."
+    return 1
+  fi
+  compose ps
+  printf '\n'
+  header "Health"
+  for svc in $ALL_SERVICES; do
+    cid=$(compose ps -q "$svc" 2>/dev/null | head -n 1 || true)
+    if [[ -z $cid ]]; then
+      state="not running"
+    else
+      state=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || echo unknown)
+    fi
+    if [[ $svc == auth && -n $cid ]]; then
+      if have curl && ver=$(curl -fsS --max-time 3 "http://127.0.0.1:$AUTH_PORT/healthz" 2>/dev/null); then
+        ver=$(printf '%s' "$ver" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        state="$state, /healthz ok${ver:+ (version $ver)}"
+      else
+        state="$state, /healthz not answering"
+      fi
+    fi
+    case $state in
+      healthy* | running*) mark="${C_GREEN}${G_OK}${C_RESET}" ;;
+      starting*) mark="${C_YELLOW}${G_WAIT}${C_RESET}" ;;
+      *) mark="${C_RED}${G_BAD}${C_RESET}" ;;
+    esac
+    printf '  %s %-10s %s\n' "$mark" "$svc" "$state"
+    if [[ -n $cid ]]; then running=1; fi
+  done
+  if [[ $running == 0 ]]; then
+    printf '\n'
+    note "Suitehive is not running. Start it with: suitehive install --dir $DIR (keeps your settings)"
+  fi
+}
+
+# ------------------------------------------------------------------ logs --
+
+cmd_logs() {
+  local follow="" tail=200 svc=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -f | --follow) follow=--follow; shift ;;
+      --tail) need_value "$@"; tail=$2; shift 2 ;;
+      -*) die "unknown option for logs: $1" ;;
+      *)
+        [[ -z $svc ]] || die "logs takes one service name"
+        svc=$1
+        shift
+        ;;
+    esac
+  done
+  if [[ -n $svc ]]; then
+    case " $ALL_SERVICES " in
+      *" $svc "*) ;;
+      *) die "unknown service \"$svc\"; choose one of: $ALL_SERVICES" ;;
+    esac
+  fi
+  [[ $tail =~ ^[0-9]+$ || $tail == all ]] || die "--tail takes a number"
+  require_install
+  have docker || die "docker is not installed"
+  compose logs --tail "$tail" $follow $svc
+}
+
+# --------------------------------------------------------------- upgrade --
+
+cmd_upgrade() {
+  local opt_version="" opt_backup=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --version) need_value "$@"; opt_version=$2; shift 2 ;;
+      --backup) opt_backup=yes; shift ;;
+      --no-backup) opt_backup=no; shift ;;
+      *) die "unknown option for upgrade: $1 (see suitehive help upgrade)" ;;
+    esac
+  done
+  require_install
+  check_docker
+  header "Upgrading Suitehive in $DIR"
+
+  if [[ -z $opt_backup ]]; then
+    if [[ $ASSUME_YES != 1 ]] && tty_ready && confirm "Take a backup first? (recommended)" y; then opt_backup=yes; fi
+  fi
+  if [[ $opt_backup == yes ]]; then
+    (cmd_backup)
+  fi
+
+  if [[ -n $opt_version ]]; then
+    step "Switching to version $opt_version"
+    env_set SH_VERSION "$opt_version"
+    IMAGE_TAG=$opt_version
+  fi
+
+  step "Refreshing docker-compose.yml, Caddyfile and initdb/"
+  note "templates: $(templates_source)"
+  install_templates
+
+  if [[ $BUILD == true ]]; then
+    step "Updating sources and rebuilding"
+    prepare_build
+    compose pull $INFRA_SERVICES
+    compose build --pull $APP_SERVICES
+  else
+    step "Pulling images (ghcr.io/suitehive/*:$IMAGE_TAG)"
+    compose pull
+  fi
+  step "Restarting"
+  compose up -d --remove-orphans
+  wait_for_auth
+  ok "Suitehive is running version $IMAGE_TAG"
+}
+
+# ---------------------------------------------------------------- backup --
+
+cmd_backup() {
+  local out=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --out) need_value "$@"; out=$2; shift 2 ;;
+      *) die "unknown option for backup: $1 (see suitehive help backup)" ;;
+    esac
+  done
+  require_install
+  check_docker >/dev/null
+  [[ -n $(compose ps -q postgres 2>/dev/null || true) ]] ||
+    die "postgres is not running; start Suitehive first (cd $DIR && docker compose up -d)"
+
+  local stamp tmp vol f
+  stamp=$(date +%Y%m%d-%H%M%S)
+  out=$(abs_path "$(pick "$out" "$DIR/backups/suitehive-$stamp.tar.gz")")
+  mkdir -p "$(dirname "$out")" "$DIR/backups"
+  tmp=$(mktemp -d "$DIR/backups/.backup-XXXXXX")
+  on_exit_remove "$tmp"
+  chmod 700 "$tmp"
+
+  step "Backing up Suitehive to $out"
+  # --no-role-passwords: restoring never overwrites the current database password.
+  compose exec -T postgres pg_dumpall -U suitehive --no-role-passwords | gzip >"$tmp/postgres.sql.gz"
+  ok "databases ($(du -h "$tmp/postgres.sql.gz" | cut -f1) compressed)"
+
+  vol=$(volume_name mailblobs)
+  if docker volume inspect "$vol" >/dev/null 2>&1; then
+    # Streams through stdout so no host directory is mounted into the container.
+    docker run --rm -v "$vol:/data:ro" alpine:3.20 tar czf - -C /data . >"$tmp/mailblobs.tar.gz"
+    ok "mail blobs ($(du -h "$tmp/mailblobs.tar.gz" | cut -f1) compressed)"
+  else
+    warn "volume $vol not found; skipping mail blobs"
+  fi
+
+  mkdir -p "$tmp/config"
+  for f in .env docker-compose.yml docker-compose.build.yml Caddyfile; do
+    if [[ -f $DIR/$f ]]; then cp -p "$DIR/$f" "$tmp/config/$f"; fi
+  done
+  if [[ -d $DIR/initdb ]]; then cp -Rp "$DIR/initdb" "$tmp/config/initdb"; fi
+  ok "configuration (.env, docker-compose.yml, Caddyfile)"
+
+  cat >"$tmp/MANIFEST" <<EOF
+suitehive-backup 1
+created=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+cli=$SUITEHIVE_CLI_VERSION
+version=$IMAGE_TAG
+domain=$DOMAIN
+EOF
+  (umask 077 && tar czf "$out.part" -C "$tmp" .)
+  chmod 600 "$out.part"
+  mv -f "$out.part" "$out"
+  ok "wrote $out ($(du -h "$out" | cut -f1))"
+  warn "the archive contains your secrets and all mail: keep it private and copy it off this server."
+}
+
+# --------------------------------------------------------------- restore --
+
+cmd_restore() {
+  local file="" keep_env=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --keep-env) keep_env=1; shift ;;
+      -*) die "unknown option for restore: $1 (see suitehive help restore)" ;;
+      *)
+        [[ -z $file ]] || die "restore takes one archive"
+        file=$1
+        shift
+        ;;
+    esac
+  done
+  [[ -n $file ]] || die "usage: suitehive restore <backup.tar.gz>"
+  [[ -f $file ]] || die "no such file: $file"
+  file=$(abs_path "$file")
+  check_docker >/dev/null
+
+  resolve_dir
+  mkdir -p "$DIR"
+  local tmp stamp domain
+  tmp=$(mktemp -d "$DIR/.restore-XXXXXX")
+  on_exit_remove "$tmp"
+  chmod 700 "$tmp"
+  tar xzf "$file" -C "$tmp" || die "cannot read $file (not a .tar.gz?)"
+  [[ -f $tmp/postgres.sql.gz && -f $tmp/MANIFEST ]] || die "$file is not a Suitehive backup (no MANIFEST/postgres.sql.gz)"
+
+  if [[ ! -f $DIR/.env ]]; then
+    [[ $keep_env == 0 ]] || die "--keep-env: there is no .env in $DIR to keep"
+    [[ -f $tmp/config/.env ]] || die "the archive has no .env and $DIR has none either"
+  fi
+  domain=$(pick "$(env_get SH_DOMAIN "$DIR/.env" 2>/dev/null || true)" "$(env_get SH_DOMAIN "$tmp/config/.env" 2>/dev/null || true)" suitehive)
+
+  header "Restore $file into $DIR"
+  sed -e 's/^/    /' "$tmp/MANIFEST"
+  confirm_typed "$domain" "This REPLACES all Suitehive data in $DIR (accounts, mail, calendars) with the backup"
+
+  stamp=$(date +%Y%m%d-%H%M%S)
+  step "Restoring configuration"
+  if [[ $keep_env == 0 && -f $tmp/config/.env ]]; then
+    if [[ -f $DIR/.env ]]; then
+      cp -p "$DIR/.env" "$DIR/.env.before-restore-$stamp"
+      note "current .env kept as .env.before-restore-$stamp"
+    fi
+    cp "$tmp/config/.env" "$DIR/.env"
+    chmod 600 "$DIR/.env"
+    ok "restored .env from the backup"
+  else
+    ok "kept the current .env"
+  fi
+  local f
+  for f in docker-compose.yml docker-compose.build.yml Caddyfile; do
+    if [[ ! -f $DIR/$f && -f $tmp/config/$f ]]; then cp "$tmp/config/$f" "$DIR/$f"; fi
+  done
+  if [[ ! -d $DIR/initdb && -d $tmp/config/initdb ]]; then cp -R "$tmp/config/initdb" "$DIR/initdb"; fi
+  mkdir -p "$DIR/backups"
+  load_settings
+
+  step "Stopping the app services"
+  compose up --no-start >/dev/null 2>&1 || compose create >/dev/null 2>&1 || true
+  compose stop caddy $APP_SERVICES >/dev/null 2>&1 || true
+  compose up -d postgres nats
+  local i
+  for i in $(seq 1 60); do
+    if compose exec -T postgres pg_isready -U suitehive -d postgres >/dev/null 2>&1; then break; fi
+    sleep 2
+  done
+  compose exec -T postgres pg_isready -U suitehive -d postgres >/dev/null 2>&1 || die "postgres did not start; see suitehive logs postgres"
+
+  step "Restoring databases"
+  local log="$DIR/backups/restore-$stamp.log" db pw
+  pw=$(prev SH_POSTGRES_PASSWORD)
+  # Make the role password match .env (the volume may predate the restored .env).
+  # Sent through stdin; the official image trusts local socket connections.
+  printf "ALTER ROLE suitehive PASSWORD '%s';\n" "$pw" |
+    compose exec -T postgres psql -q -U suitehive -d postgres -v ON_ERROR_STOP=1 >/dev/null
+  for db in $DATABASES; do
+    printf 'DROP DATABASE IF EXISTS %s WITH (FORCE);\n' "$db" |
+      compose exec -T postgres psql -q -U suitehive -d postgres -v ON_ERROR_STOP=1 >/dev/null
+  done
+  # Harmless errors (e.g. "role suitehive already exists") go to the log.
+  gunzip -c "$tmp/postgres.sql.gz" | compose exec -T postgres psql -U suitehive -d postgres >"$log" 2>&1 || true
+  chmod 600 "$log" 2>/dev/null || true
+  for db in $DATABASES; do
+    compose exec -T postgres psql -tA -U suitehive -d postgres -c "SELECT 1 FROM pg_database WHERE datname = '$db'" 2>/dev/null | grep -q 1 ||
+      die "database $db is missing after the restore; see $log"
+  done
+  ok "databases restored (psql output in $log)"
+
+  if [[ -f $tmp/mailblobs.tar.gz ]]; then
+    step "Restoring mail blobs"
+    local vol
+    vol=$(volume_name mailblobs)
+    docker run --rm -i -v "$vol:/data" alpine:3.20 \
+      sh -c 'find /data -mindepth 1 -delete && tar xzf - -C /data' <"$tmp/mailblobs.tar.gz"
+    ok "mail blobs restored"
+  fi
+
+  step "Starting Suitehive"
+  compose up -d --remove-orphans
+  wait_for_auth
+  ok "restore complete"
+}
+
+# ------------------------------------------------------------------- dns --
+
+# dkim_from_api <token>: print the DKIM records Mail expects (needs an admin token).
+dkim_from_api() {
+  local token=$1 tmp url
+  url="$PUBLIC_URL/api/mail/admin/domains/$DOMAIN/dns?check=false"
+  have curl || {
+    warn "curl is needed to fetch DKIM records"
+    return 0
+  }
+  tmp=$(mktemp)
+  on_exit_remove "$tmp"
+  # The token goes through a curl config on stdin, not the command line.
+  if ! printf 'header = "Authorization: Bearer %s"\n' "$token" |
+    curl -fsS --max-time 15 -K - -o "$tmp" "$url" 2>/dev/null; then
+    warn "could not read $url (wrong token, or the domain is not verified yet?)"
+    return 0
+  fi
+  local rows
+  if have jq; then
+    rows=$(jq -r '.records[]? | select(.purpose == "dkim") | "\(.name)|\(.expectedValue)|\(.status)"' "$tmp" 2>/dev/null || true)
+  else
+    rows=$(tr -d '\n' <"$tmp" | tr '{' '\n' | grep '"purpose"[[:space:]]*:[[:space:]]*"dkim"' |
+      sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*"expectedValue"[[:space:]]*:[[:space:]]*"\([^"]*\)".*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1|\2|\3/p' || true)
+  fi
+  if [[ -z $rows ]]; then
+    note "No DKIM key yet: it is generated once the domain is verified."
+    return 0
+  fi
+  local name value status
+  while IFS='|' read -r name value status; do
+    printf '  %-4s  %s  (%s)\n        %s\n' TXT "$name" "$status" "$value"
+  done <<<"$rows"
+}
+
+cmd_dns() {
+  local check="" token=${SH_ADMIN_TOKEN:-}
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --check) check=yes; shift ;;
+      --no-check) check=no; shift ;;
+      --token) need_value "$@"; token=$2; shift 2 ;;
+      *) die "unknown option for dns: $1 (see suitehive help dns)" ;;
+    esac
+  done
+  require_install
+  if [[ $LOCAL == true ]]; then
+    info "This is a local trial install ($DEMO_DOMAIN on localhost): no DNS records are needed."
+    return 0
+  fi
+  if [[ -z $check ]]; then
+    if have dig || have nslookup; then check=yes; else check=no; fi
+  fi
+  if [[ $check == yes ]] && ! have dig && ! have nslookup; then
+    die "--check needs dig (dnsutils / bind-utils) or nslookup"
+  fi
+  public_ips
+  header "DNS records for $DOMAIN"
+  if [[ $check == yes ]]; then
+    note "checking with $(have dig && echo dig || echo nslookup) (results can lag behind your DNS panel by the record TTL)"
+    print_dns_table check
+  else
+    print_dns_table
+  fi
+  printf '\n'
+  header "DKIM"
+  if [[ -n $token ]]; then
+    dkim_from_api "$token"
+  else
+    note "Pass --token <admin API token> (or set SH_ADMIN_TOKEN) to show the DKIM record here."
+  fi
+  printf '\n'
+  dns_notes
+}
+
+# ------------------------------------------------------------- uninstall --
+
+cmd_uninstall() {
+  local purge=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --purge) purge=1; shift ;;
+      *) die "unknown option for uninstall: $1 (see suitehive help uninstall)" ;;
+    esac
+  done
+  require_install
+  check_docker >/dev/null
+  header "Uninstalling Suitehive from $DIR"
+  note "Tip: \`suitehive backup\` first if there is anything you want to keep."
+  if [[ $purge == 1 ]]; then
+    case $DIR in
+      / | "$HOME" | /opt | /usr | /usr/* | /etc | /var | /home) die "refusing to delete $DIR" ;;
+    esac
+    confirm_typed "$DOMAIN" "This permanently deletes ALL Suitehive data (mail, calendars, accounts, certificates) and $DIR"
+    step "Removing containers and data volumes"
+    compose down --volumes --remove-orphans
+    step "Deleting $DIR"
+    rm -rf "$DIR" || die "could not delete $DIR (permissions?)"
+    ok "Suitehive and all its data were removed"
+  else
+    confirm "Stop and remove the Suitehive containers? Data volumes are kept." y || die "cancelled"
+    step "Removing containers (data volumes are kept)"
+    compose down --remove-orphans
+    ok "stopped. Start again with: suitehive install --dir $DIR"
+    note "To delete all data as well: suitehive uninstall --purge"
+  fi
+  if have suitehive; then note "The CLI itself is $(command -v suitehive); delete that file to remove it."; fi
+}
+
+# --------------------------------------------------------------- version --
+
+cmd_version() {
+  printf 'suitehive CLI   %s\n' "$SUITEHIVE_CLI_VERSION"
+  resolve_dir
+  if [[ -f $DIR/.env ]]; then
+    load_settings
+    printf 'images          ghcr.io/suitehive/*:%s  (%s)\n' "$IMAGE_TAG" "$DIR"
+  else
+    printf 'images          (no install found in %s)\n' "$DIR"
+  fi
+  if have docker; then
+    printf 'docker compose  %s\n' "$(docker compose version --short 2>/dev/null || echo 'not available')"
+  else
+    printf 'docker          not installed\n'
+  fi
+}
+
+# ============================================================ 6. main ==
+
+main() {
+  setup_output
+
+  # Normalize --opt=value into --opt value, and pull out global options.
+  local args=() a cmd
+  while [[ $# -gt 0 ]]; do
+    a=$1
+    shift
+    case $a in
+      --*=*) set -- "${a%%=*}" "${a#*=}" "$@"; continue ;;
+    esac
+    case $a in
+      --dir) need_value --dir "$@"; OPT_DIR=$1; shift ;;
+      -y | --yes) ASSUME_YES=1 ;;
+      --no-color) C_BOLD="" C_DIM="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_CYAN="" C_RESET="" ;;
+      *) args=(${args[@]+"${args[@]}"} "$a") ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
+
+  cmd=${1:-help}
+  if [[ $# -gt 0 ]]; then shift; fi
+  case $cmd in
+    -h | --help | help) cmd_help "$@" ;;
+    -V | --version | version)
+      for a in "$@"; do case $a in -h | --help) help_version; return 0 ;; esac; done
+      cmd_version
+      ;;
+    install | status | logs | upgrade | backup | restore | dns | uninstall)
+      for a in "$@"; do
+        case $a in -h | --help) "help_$cmd"; return 0 ;; esac
+      done
+      "cmd_$cmd" "$@"
+      ;;
+    *) die "unknown command: $cmd (see suitehive help)" ;;
+  esac
+}
+
+# Run main unless this file is sourced (lets tests call single functions).
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
