@@ -39,8 +39,8 @@
 	encode zstd gzip
 	import security_headers
 
-	# Calendar: web app, API, CalDAV, and the CalDAV/CardDAV discovery URLs.
-	@calendar path /calendar /calendar/* /api/calendar/* /dav /dav/* /.well-known/caldav /.well-known/carddav
+	# Calendar: web app, API, private iCal feeds, CalDAV, and the CalDAV/CardDAV discovery URLs.
+	@calendar path /calendar /calendar/* /api/calendar/* /ical/* /dav /dav/* /.well-known/caldav /.well-known/carddav
 	handle @calendar {
 		reverse_proxy calendar:8083
 	}
